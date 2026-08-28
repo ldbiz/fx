@@ -23,11 +23,9 @@ const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
 const command_result_mapping = @import("../../tooling/command_result_mapping.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
-const tool_args = @import("../../tooling/tool_args.zig");
 const hooks = @import("../../hooks/hooks.zig");
 const command_contract = @import("../../execution/command_contract.zig");
 const command_environment = @import("../../execution/command_environment.zig");
-const terminal_contracts = @import("../../terminal/contracts.zig");
 const context_contract = @import("../../workspace/context_contract.zig");
 const tool_preparation = @import("../tool_preparation.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
@@ -53,7 +51,6 @@ const runtime_interruption = @import("interruption.zig");
 const runtime_parallel_execution = @import("parallel_execution.zig");
 const runtime_tool_batch = @import("tool_batch.zig");
 const model_response_recovery = @import("model_response_recovery.zig");
-const tool_mcp_runtime = @import("../../tooling/tool_mcp_runtime.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -100,96 +97,6 @@ fn terminal_request_normalization_eligible(
     return base_nested_terminal_advertised and vision_mode != .required;
 }
 
-fn terminal_action_is(object: std.json.ObjectMap, action_name: []const u8) bool {
-    const action = object.get("action") orelse return false;
-    return action == .string and std.mem.eql(u8, action.string, action_name);
-}
-
-fn terminal_lease_is_absent(value: std.json.Value) bool {
-    return switch (value) {
-        .null => true,
-        .string => |text| tool_args.isNullPlaceholderText(text),
-        else => false,
-    };
-}
-
-fn elide_terminal_null_lease(object: *std.json.ObjectMap) void {
-    const lease = object.get("lease") orelse return;
-    if (!terminal_lease_is_absent(lease)) return;
-    _ = object.orderedRemove("lease");
-}
-
-const TerminalModelPayloadMapping = struct {
-    kind: []const u8,
-    model_field: []const u8,
-    internal_field: []const u8,
-};
-
-const terminal_model_payload_mappings = [_]TerminalModelPayloadMapping{
-    .{ .kind = "text", .model_field = "text", .internal_field = "text" },
-    .{ .kind = "keys", .model_field = "keys", .internal_field = "keys" },
-    .{ .kind = "controls", .model_field = "controls", .internal_field = "controls" },
-    .{ .kind = "paste", .model_field = "paste", .internal_field = "text" },
-};
-
-fn terminal_payload_mapping(
-    wanted: []const u8,
-    comptime field: enum { kind, model },
-) ?TerminalModelPayloadMapping {
-    for (terminal_model_payload_mappings) |mapping| {
-        const candidate = switch (field) {
-            .kind => mapping.kind,
-            .model => mapping.model_field,
-        };
-        if (std.mem.eql(u8, candidate, wanted)) return mapping;
-    }
-    return null;
-}
-
-fn project_terminal_model_write(
-    arena: Allocator,
-    object: *std.json.ObjectMap,
-) Allocator.Error!bool {
-    if (!terminal_action_is(object.*, "write")) return false;
-    elide_terminal_null_lease(object);
-    if (object.get("lease") != null or object.get("input") != null) {
-        return false;
-    }
-    const write = object.get("write") orelse return false;
-    if (write != .object) return false;
-    const kind = write.object.get("kind") orelse return false;
-    if (kind != .string) return false;
-    const mapping = terminal_payload_mapping(kind.string, .kind) orelse return false;
-    const payload = write.object.get(mapping.internal_field) orelse return false;
-    var input = std.json.Value{ .object = .empty };
-    try input.object.put(arena, mapping.model_field, payload);
-    try object.put(arena, "input", input);
-    _ = object.orderedRemove("write");
-    return true;
-}
-
-fn normalize_terminal_model_input(
-    arena: Allocator,
-    object: *std.json.ObjectMap,
-) Allocator.Error!bool {
-    if (!terminal_action_is(object.*, "write")) return false;
-    elide_terminal_null_lease(object);
-    if (object.get("write") != null or object.get("lease") != null) {
-        return false;
-    }
-    const input = object.get("input") orelse return false;
-    if (input != .object or input.object.count() != 1) return false;
-    const input_key = input.object.keys()[0];
-    const input_value = input.object.values()[0];
-    const mapping = terminal_payload_mapping(input_key, .model) orelse return false;
-    var write = std.json.Value{ .object = .empty };
-    try write.object.put(arena, "kind", .{ .string = mapping.kind });
-    try write.object.put(arena, mapping.internal_field, input_value);
-    try object.put(arena, "write", write);
-    _ = object.orderedRemove("input");
-    return true;
-}
-
 fn projected_terminal_request_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
@@ -200,22 +107,11 @@ fn projected_terminal_request_arguments(
     };
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-    const arena = parsed.arena.allocator();
     if (parsed.value.object.count() == 1) {
-        if (parsed.value.object.getPtr("request")) |request| {
-            if (request.* == .object) {
-                if (!try project_terminal_model_write(arena, &request.object)) {
-                    return null;
-                }
-                var wrapped_out: std.Io.Writer.Allocating = .init(alloc);
-                defer wrapped_out.deinit();
-                std.json.Stringify.value(parsed.value, .{}, &wrapped_out.writer) catch
-                    return error.OutOfMemory;
-                return try wrapped_out.toOwnedSlice();
-            }
+        if (parsed.value.object.get("request")) |request| {
+            if (request == .object) return null;
         }
     }
-    _ = try project_terminal_model_write(arena, &parsed.value.object);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -293,164 +189,13 @@ fn normalized_terminal_request_arguments(
     };
     defer parsed.deinit();
     if (parsed.value != .object or parsed.value.object.count() != 1) return null;
-    const request = parsed.value.object.getPtr("request") orelse return null;
-    if (request.* != .object) return null;
-    _ = try normalize_terminal_model_input(
-        parsed.arena.allocator(),
-        &request.object,
-    );
+    const request = parsed.value.object.get("request") orelse return null;
+    if (request != .object) return null;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(request.*, .{}, &out.writer) catch return error.OutOfMemory;
+    std.json.Stringify.value(request, .{}, &out.writer) catch return error.OutOfMemory;
     return try out.toOwnedSlice();
-}
-
-const AgentTerminalLeaseTransition = union(enum) {
-    track: []const u8,
-    remove: []const u8,
-    atomic: []const u8,
-};
-
-fn agent_terminal_lease_transition(
-    alloc: Allocator,
-    registry: tool_dispatch.Registry,
-    call: ToolCall,
-) !?AgentTerminalLeaseTransition {
-    const tool = registry.lookup(call.name) orelse return null;
-    if (tool.executor_kind != .terminal) return null;
-    const parsed = std.json.parseFromSliceLeaky(
-        std.json.Value,
-        alloc,
-        call.arguments_json,
-        .{},
-    ) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.InvalidTerminalLeaseTrackingInput,
-    };
-    if (parsed != .object) return error.InvalidTerminalLeaseTrackingInput;
-    const action = parsed.object.get("action") orelse return error.InvalidTerminalLeaseTrackingInput;
-    if (action != .string) return error.InvalidTerminalLeaseTrackingInput;
-    const is_write = std.mem.eql(u8, action.string, "write");
-    const is_close = std.mem.eql(u8, action.string, "close");
-    if (!is_write and !is_close) return null;
-    const session_id = parsed.object.get("session_id") orelse
-        return error.InvalidTerminalLeaseTrackingInput;
-    if (session_id != .string) {
-        return error.InvalidTerminalLeaseTrackingInput;
-    }
-    if (is_close) return .{ .remove = session_id.string };
-    const lease_value = parsed.object.get("lease");
-    const lease_absent = lease_value == null or terminal_lease_is_absent(lease_value.?);
-    if (lease_absent) {
-        const write = parsed.object.get("write") orelse
-            return error.InvalidTerminalLeaseTrackingInput;
-        if (write == .null) return error.InvalidTerminalLeaseTrackingInput;
-        return .{ .atomic = session_id.string };
-    }
-    const concrete_lease = lease_value.?;
-    if (concrete_lease != .string) return error.InvalidTerminalLeaseTrackingInput;
-    const lease = std.meta.stringToEnum(
-        terminal_contracts.WriteLeaseIntent,
-        concrete_lease.string,
-    ) orelse return error.InvalidTerminalLeaseTrackingInput;
-    return switch (lease) {
-        .acquire, .use => .{ .track = session_id.string },
-        .release, .revoke => .{ .remove = session_id.string },
-    };
-}
-
-test "agent terminal lease transitions derive from normalized validated actions" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const terminal_tool = tool_dispatch.Tool{
-        .name = "terminal",
-        .description = "terminal",
-        .model_schema = .{ .name = "terminal", .description = "terminal" },
-        .executor_kind = .terminal,
-        .decode = undefined,
-        .call = undefined,
-        .reads_only_fn = undefined,
-        .irreversible_fn = undefined,
-    };
-    const registry = tool_dispatch.Registry{ .tools = &.{terminal_tool} };
-    const cases = [_]struct {
-        lease: []const u8,
-        track: bool,
-    }{
-        .{ .lease = "acquire", .track = true },
-        .{ .lease = "use", .track = true },
-        .{ .lease = "release", .track = false },
-        .{ .lease = "revoke", .track = false },
-    };
-    for (cases) |case| {
-        const arguments_json = try std.fmt.allocPrint(
-            arena,
-            "{{\"action\":\"write\",\"session_id\":\"terminal-one\",\"lease\":\"{s}\",\"write\":null}}",
-            .{case.lease},
-        );
-        const transition = (try agent_terminal_lease_transition(
-            arena,
-            registry,
-            .{ .id = "call", .name = "terminal", .arguments_json = arguments_json },
-        )).?;
-        switch (transition) {
-            .track => |session_id| {
-                try std.testing.expect(case.track);
-                try std.testing.expectEqualStrings("terminal-one", session_id);
-            },
-            .remove => |session_id| {
-                try std.testing.expect(!case.track);
-                try std.testing.expectEqualStrings("terminal-one", session_id);
-            },
-            .atomic => unreachable,
-        }
-    }
-    const atomic_arguments = [_][]const u8{
-        "{\"action\":\"write\",\"session_id\":\"terminal-one\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}",
-        "{\"action\":\"write\",\"session_id\":\"terminal-one\",\"lease\":null,\"write\":{\"kind\":\"text\",\"text\":\"input\"}}",
-        "{\"action\":\"write\",\"session_id\":\"terminal-one\",\"lease\":\"null\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}",
-    };
-    for (atomic_arguments) |arguments_json| {
-        const atomic = (try agent_terminal_lease_transition(
-            arena,
-            registry,
-            .{
-                .id = "atomic",
-                .name = "terminal",
-                .arguments_json = arguments_json,
-            },
-        )).?;
-        switch (atomic) {
-            .atomic => |session_id| try std.testing.expectEqualStrings(
-                "terminal-one",
-                session_id,
-            ),
-            .track, .remove => unreachable,
-        }
-    }
-    const close = (try agent_terminal_lease_transition(
-        arena,
-        registry,
-        .{
-            .id = "close",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"close\",\"session_id\":\"terminal-one\",\"close_policy\":\"force\"}",
-        },
-    )).?;
-    switch (close) {
-        .remove => |session_id| try std.testing.expectEqualStrings(
-            "terminal-one",
-            session_id,
-        ),
-        .track, .atomic => unreachable,
-    }
-    try std.testing.expect((try agent_terminal_lease_transition(
-        arena,
-        registry,
-        .{ .id = "list", .name = "terminal", .arguments_json = "{\"action\":\"list\"}" },
-    )) == null);
 }
 
 fn normalize_terminal_request_tool_calls(
@@ -531,45 +276,6 @@ test "terminal request normalization follows effective attempt advertisement" {
     try std.testing.expect(!terminal_request_normalization_eligible(false, .unavailable));
 }
 
-test "terminal inferred model input round trips every atomic write payload" {
-    const alloc = std.testing.allocator;
-    const cases = [_]struct {
-        internal: []const u8,
-        model: []const u8,
-    }{
-        .{
-            .internal = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"text\",\"text\":\"hello\"}}",
-            .model = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"text\":\"hello\"}}}",
-        },
-        .{
-            .internal = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}",
-            .model = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"keys\":[\"enter\"]}}}",
-        },
-        .{
-            .internal = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"controls\",\"controls\":[108]}}",
-            .model = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"controls\":[108]}}}",
-        },
-        .{
-            .internal = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"paste\",\"text\":\"large\"}}",
-            .model = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"paste\":\"large\"}}}",
-        },
-    };
-    for (cases) |case| {
-        const projected = (try projected_terminal_request_arguments(
-            alloc,
-            case.internal,
-        )).?;
-        defer alloc.free(projected);
-        try std.testing.expectEqualStrings(case.model, projected);
-        const normalized = (try normalized_terminal_request_arguments(
-            alloc,
-            projected,
-        )).?;
-        defer alloc.free(normalized);
-        try std.testing.expectEqualStrings(case.internal, normalized);
-    }
-}
-
 test "terminal request projection wraps eligible flat objects without changing source messages" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -601,10 +307,6 @@ test "terminal request projection wraps eligible flat objects without changing s
         .{ .id = "non-string-action", .input = "{\"action\":7}", .expected = "{\"request\":{\"action\":7}}" },
         .{ .id = "unknown-action", .input = "{\"action\":\"unknown\"}", .expected = "{\"request\":{\"action\":\"unknown\"}}" },
         .{ .id = "valid-action", .input = "{\"action\":\"list\"}", .expected = "{\"request\":{\"action\":\"list\"}}" },
-        .{ .id = "atomic-keys", .input = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}", .expected = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"keys\":[\"enter\"]}}}" },
-        .{ .id = "null-lease", .input = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":null,\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}", .expected = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"keys\":[\"enter\"]}}}" },
-        .{ .id = "textual-null-lease", .input = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"null\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}", .expected = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"keys\":[\"enter\"]}}}" },
-        .{ .id = "explicit-lease", .input = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"use\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}", .expected = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"use\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}}" },
         .{ .id = "null-request", .input = "{\"request\":null}", .expected = "{\"request\":{\"request\":null}}" },
         .{ .id = "request-sibling", .input = "{\"request\":{\"action\":\"list\"},\"sibling\":true}", .expected = "{\"request\":{\"request\":{\"action\":\"list\"},\"sibling\":true}}" },
         .{ .id = "exact-wrapper", .input = "{\"request\":{\"action\":\"list\"}}", .expected = "{\"request\":{\"action\":\"list\"}}" },
@@ -661,7 +363,6 @@ fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void
     const first_calls = [_]ToolCall{
         .{ .id = "one", .name = "terminal", .arguments_json = "{}" },
         .{ .id = "two", .name = "terminal", .arguments_json = "{\"action\":null}" },
-        .{ .id = "atomic", .name = "terminal", .arguments_json = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}" },
     };
     const second_calls = [_]ToolCall{
         .{ .id = "three", .name = "terminal", .arguments_json = "{\"action\":\"list\"}" },
@@ -675,10 +376,6 @@ fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void
     defer free_terminal_request_projection(alloc, &source, projected);
     try std.testing.expectEqualStrings("{\"request\":{}}", projected[0].tool_calls[0].arguments_json);
     try std.testing.expectEqualStrings("{\"request\":{\"action\":null}}", projected[0].tool_calls[1].arguments_json);
-    try std.testing.expectEqualStrings(
-        "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"text\":\"input\"}}}",
-        projected[0].tool_calls[2].arguments_json,
-    );
     try std.testing.expectEqualStrings("{\"request\":{\"action\":\"list\"}}", projected[1].tool_calls[0].arguments_json);
 }
 
@@ -745,63 +442,6 @@ test "terminal request normalization unwraps only exact eligible native calls" {
     try std.testing.expectEqual(calls[0].provenance, normalized[0].provenance);
     try std.testing.expectEqualStrings(calls[1].arguments_json, normalized[1].arguments_json);
 
-    const inferred_write_calls = [_]ToolCall{.{
-        .id = "inferred-write",
-        .name = "terminal",
-        .arguments_json = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"keys\":[\"enter\"]}}}",
-    }};
-    const inferred_write = try normalize_terminal_request_tool_calls(
-        arena,
-        native_registry,
-        true,
-        &inferred_write_calls,
-    );
-    try std.testing.expectEqualStrings(
-        "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}",
-        inferred_write[0].arguments_json,
-    );
-
-    const semantic_null_write_calls = [_]ToolCall{
-        .{
-            .id = "null-lease-write",
-            .name = "terminal",
-            .arguments_json = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":null,\"input\":{\"keys\":[\"enter\"]}}}",
-        },
-        .{
-            .id = "textual-null-lease-write",
-            .name = "terminal",
-            .arguments_json = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"null\",\"input\":{\"keys\":[\"enter\"]}}}",
-        },
-    };
-    const semantic_null_writes = try normalize_terminal_request_tool_calls(
-        arena,
-        native_registry,
-        true,
-        &semantic_null_write_calls,
-    );
-    for (semantic_null_writes) |call| {
-        try std.testing.expectEqualStrings(
-            "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}",
-            call.arguments_json,
-        );
-    }
-
-    const invalid_input_calls = [_]ToolCall{.{
-        .id = "invalid-input",
-        .name = "terminal",
-        .arguments_json = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"text\":\"x\",\"keys\":[\"enter\"]}}}",
-    }};
-    const invalid_input = try normalize_terminal_request_tool_calls(
-        arena,
-        native_registry,
-        true,
-        &invalid_input_calls,
-    );
-    try std.testing.expectEqualStrings(
-        "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"text\":\"x\",\"keys\":[\"enter\"]}}",
-        invalid_input[0].arguments_json,
-    );
-
     const ineligible = try normalize_terminal_request_tool_calls(arena, native_registry, false, &calls);
     try std.testing.expectEqual(calls[0..].ptr, ineligible.ptr);
     try std.testing.expectEqual(wrapped.ptr, ineligible[0].arguments_json.ptr);
@@ -844,7 +484,6 @@ fn check_terminal_request_normalization_allocation_failures(alloc: Allocator) !v
     const source = [_]ToolCall{
         .{ .id = "one", .name = "terminal", .arguments_json = "{\"request\":{\"action\":\"exec\",\"command\":\"true\"}}" },
         .{ .id = "two", .name = "terminal", .arguments_json = "{\"request\":{\"action\":\"start\"}}" },
-        .{ .id = "atomic", .name = "terminal", .arguments_json = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"text\":\"input\"}}}" },
     };
     const normalized = try normalize_terminal_request_tool_calls(alloc, registry, true, &source);
     if (normalized.ptr == source[0..].ptr) return error.TestUnexpectedResult;
@@ -863,10 +502,6 @@ fn check_terminal_request_normalization_allocation_failures(alloc: Allocator) !v
     try std.testing.expectEqualStrings(
         "{\"action\":\"start\"}",
         normalized[1].arguments_json,
-    );
-    try std.testing.expectEqualStrings(
-        "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}",
-        normalized[2].arguments_json,
     );
 }
 
@@ -1028,8 +663,7 @@ fn prepareDeferredDynamicCandidate(
     const validate = ctx.deps.validate_tool_call orelse return false;
     return switch (try validate(ctx.deps.ctx, alloc, call)) {
         .not_registered => false,
-        .valid => true,
-        .failure => true,
+        .valid, .failure => true,
     };
 }
 
@@ -1447,6 +1081,7 @@ fn materializeConfirmedProviderTools(
     arena: Allocator,
     config: Config,
     turn_id: u64,
+    provider: types.ProviderId,
     completion: types.ModelCompletion,
     advertised_dynamic_tool_names: []const []const u8,
     step_ctx: TraceContext,
@@ -1479,6 +1114,7 @@ fn materializeConfirmedProviderTools(
         within_turn_suffix,
         null,
         novel_calls,
+        provider,
         completion.provider_state_json,
     );
     var batch: runtime_tool_batch.StepBatchState = .{};
@@ -1734,7 +1370,7 @@ fn streamReplaySafe(
 const read_failure_tool_recovery_instruction =
     \\<network_recovery>
     \\The previous response stream ended because the network connection was interrupted.
-    \\fx did not execute the incomplete tool call from that stream. Recreate the tool call if it is still needed.
+    \\Fx did not execute the incomplete tool call from that stream. Recreate the tool call if it is still needed.
     \\</network_recovery>
 ;
 
@@ -2158,27 +1794,18 @@ fn isPostVisionAssistantPrefillRejection(
         std.mem.find(u8, detail, "must end with a user message") != null;
 }
 
-fn recovery_deadline(delay_ns: u64) std.Io.Clock.Timestamp {
-    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
-    return .{
-        .clock = .awake,
-        .raw = started.raw.addDuration(.fromNanoseconds(@intCast(delay_ns))),
-    };
-}
-
-fn wait_for_recovery_deadline(
+fn waitForRecoveryDelay(
     cancel_flag: *std.atomic.Value(bool),
-    deadline: std.Io.Clock.Timestamp,
+    delay_ns: u64,
 ) bool {
     if (comptime builtin.is_test) return !cancel_flag.load(.seq_cst);
-    std.debug.assert(deadline.clock == .awake);
-    const quantum: i96 = 25 * std.time.ns_per_ms;
-    while (true) {
+    var remaining = delay_ns;
+    const quantum = 25 * std.time.ns_per_ms;
+    while (remaining > 0) {
         if (cancel_flag.load(.seq_cst)) return false;
-        const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
-        if (!std.Io.Clock.Timestamp.compare(now, .lt, deadline)) break;
-        const remaining = now.raw.durationTo(deadline.raw).toNanoseconds();
-        io_mod.getIo().sleep(.fromNanoseconds(@min(remaining, quantum)), .awake) catch {};
+        const current = @min(remaining, quantum);
+        io_mod.sleep(current);
+        remaining -= current;
     }
     return !cancel_flag.load(.seq_cst);
 }
@@ -2361,16 +1988,15 @@ fn refreshGatewayCredentialForJob(
     return true;
 }
 
-fn auto_retry_status(
+fn pushAutoRetryStatus(
+    deps: *const AgentRuntimeDeps,
     failed_attempt: usize,
     attempt_limit: usize,
     cause: model_response_recovery.FailureCause,
-    strategy: model_response_recovery.Strategy,
-    delay_seconds: u64,
-    retry_deadline: ?std.Io.Clock.Timestamp,
+    decision: model_response_recovery.Decision,
     diagnostic: types.ModelFailureDiagnostic,
-) types.RouteRecoveryStatus {
-    return .{
+) !void {
+    try pushRouteRecoveryStatus(deps, .{
         .kind = .auto_retry,
         .failed_attempt = failed_attempt,
         .attempt_limit = attempt_limit,
@@ -2384,7 +2010,7 @@ fn auto_retry_status(
             .request_limit_reached => .request_limit_reached,
             .content_filter => null,
         },
-        .action = switch (strategy) {
+        .action = switch (decision.strategy) {
             .retry_request => .retrying_request,
             .continue_response => .continuing_response,
             .regenerate_tool => .regenerating_tool,
@@ -2393,47 +2019,10 @@ fn auto_retry_status(
             .pause => .paused,
             .stop => null,
         },
-        .delay_seconds = delay_seconds,
-        .retry_deadline = retry_deadline,
+        .delay_seconds = decision.delay_ns / std.time.ns_per_s,
         .diagnostic = diagnostic,
-    };
+    });
 }
-
-fn pushAutoRetryStatus(
-    deps: *const AgentRuntimeDeps,
-    failed_attempt: usize,
-    attempt_limit: usize,
-    cause: model_response_recovery.FailureCause,
-    decision: model_response_recovery.Decision,
-    diagnostic: types.ModelFailureDiagnostic,
-) !std.Io.Clock.Timestamp {
-    const deadline = recovery_deadline(decision.delay_ns);
-    try pushRouteRecoveryStatus(deps, auto_retry_status(
-        failed_attempt,
-        attempt_limit,
-        cause,
-        decision.strategy,
-        decision.delay_ns / std.time.ns_per_s,
-        deadline,
-        diagnostic,
-    ));
-    return deadline;
-}
-
-const ProviderAdmission = struct {
-    deps: *const AgentRuntimeDeps,
-    stream: *runtime_assistant_stream.StreamChunkContext,
-    pending_status: *?types.RouteRecoveryStatus,
-
-    fn admit(raw: *anyopaque) !void {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        runtime_assistant_stream.publishTurnPhase(self.stream, .thinking);
-        if (self.pending_status.*) |status| {
-            try pushRouteRecoveryStatus(self.deps, status);
-            self.pending_status.* = null;
-        }
-    }
-};
 
 fn pushAutoRecoveredStatus(
     deps: *const AgentRuntimeDeps,
@@ -2619,25 +2208,13 @@ pub fn processQueuedPrompt(
     if (effective_job.turn_id == 0) {
         effective_job.turn_id = debug_trace.nextTurnId();
     }
-    var effective_config = config;
-    if (effective_config.origin == .subagent and effective_config.subagent_id == 0) {
-        effective_config.subagent_id = debug_trace.nextSubagentId();
-    }
-    var effective_lifecycle = lifecycle;
-    if (effective_config.origin == .subagent and
-        effective_lifecycle.scope.kind == .subagent and
-        effective_lifecycle.scope.subagent_id == null)
-    {
-        effective_lifecycle.scope.subagent_id = effective_config.subagent_id;
-    }
     var finalization = TurnFinalizationGuard.init(
         deps,
         effective_job.turn_id,
-        effective_lifecycle,
+        lifecycle,
     );
-    defer finalization.deinit();
 
-    processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization) catch |err| {
+    processQueuedPromptInner(deps, semantic_presentation, lifecycle, config, effective_job, &finalization) catch |err| {
         if (finalization.state == .open) {
             finalization.finish(.failed, null, null) catch |finalization_err| return finalization_err;
         }
@@ -3214,16 +2791,6 @@ fn processQueuedPromptLoop(
     else
         .transport_interrupted;
     var latest_recovery_diagnostic: ?types.ModelFailureDiagnostic = null;
-    var pending_auto_retry_status: ?types.RouteRecoveryStatus = null;
-    errdefer if (pending_auto_retry_status != null) {
-        clearAutoRetryStatusIfNeeded(deps, true) catch |clear_err| {
-            debug_trace.logf(
-                "agent",
-                "failed to clear due retry status err={s}",
-                .{@errorName(clear_err)},
-            );
-        };
-    };
     var preserved_tool_evidence: model_response_recovery.ToolEvidence = if (job.recovery_checkpoint) |checkpoint|
         restoredRecoveryToolEvidence(checkpoint.tool_state)
     else
@@ -3248,15 +2815,6 @@ fn processQueuedPromptLoop(
         _ = overlay_arena_state.reset(.retain_capacity);
         const overlay_arena = overlay_arena_state.allocator();
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
-        if (deps.take_steering) |take_steering| {
-            const guidance = try take_steering(deps.ctx, overlay_arena, turn_id);
-            for (guidance) |text| {
-                try within_turn_suffix.append(arena, .{
-                    .role = .user,
-                    .content = try runtime_execution_memory.steeringMessage(arena, text),
-                });
-            }
-        }
         if (config.explicit_skills_prompt_section.len > 0) {
             try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = config.explicit_skills_prompt_section });
         }
@@ -3379,7 +2937,6 @@ fn processQueuedPromptLoop(
                     pausedRequiredAction(preserved_tool_evidence),
                     latest_recovery_diagnostic,
                 );
-                pending_auto_retry_status = null;
                 return;
             }
             if (semantic_attempt >= semantic_limit) {
@@ -3416,7 +2973,6 @@ fn processQueuedPromptLoop(
                     pausedRequiredAction(preserved_tool_evidence),
                     defaultRecoveryDiagnostic(.request_limit_reached),
                 );
-                pending_auto_retry_status = null;
                 return;
             }
             if (skip_next_preflight_refresh) {
@@ -3549,11 +3105,6 @@ fn processQueuedPromptLoop(
                 .stream = &stream_ctx,
                 .required_vision = vision_mode == .required,
             };
-            var provider_admission = ProviderAdmission{
-                .deps = deps,
-                .stream = &stream_ctx,
-                .pending_status = &pending_auto_retry_status,
-            };
             var model_request = agent_stream_provider.ModelRequest{
                 .credential = .{
                     .secret = active_api_key,
@@ -3586,7 +3137,6 @@ fn processQueuedPromptLoop(
                 .delivery = &gateway_delivery,
                 .attempt_evidence = &gateway_attempt_evidence,
                 .events = .{ .context = &provider_events, .emit_fn = onProviderEvent },
-                .admission = .{ .context = &provider_admission, .admit_fn = ProviderAdmission.admit },
                 .cancel_flag = config.cancel_flag,
                 .provider_attempt_owner = .agent,
             };
@@ -3594,7 +3144,7 @@ fn processQueuedPromptLoop(
                 deps.agent_stream_provider,
                 arena,
                 model_request,
-                deps.usage,
+                if (config.provider_capabilities.deferred_usage) deps.usage else null,
                 deps.usage_allocator,
             ) catch |err| {
                 parent_turn_delivery.observeGatewayDelivery(
@@ -3659,7 +3209,6 @@ fn processQueuedPromptLoop(
                         )),
                         failure_diagnostic,
                     );
-                    pending_auto_retry_status = null;
                     return;
                 }
                 var recovery_decision = if (network_failure) |evidence|
@@ -3742,9 +3291,8 @@ fn processQueuedPromptLoop(
                     step_ctx,
                 );
                 const auto_retry_status_published = will_auto_retry;
-                var retry_deadline: ?std.Io.Clock.Timestamp = null;
                 if (auto_retry_status_published) {
-                    retry_deadline = try pushAutoRetryStatus(
+                    try pushAutoRetryStatus(
                         deps,
                         consumed_attempts,
                         semantic_limit,
@@ -3753,9 +3301,9 @@ fn processQueuedPromptLoop(
                         failure_diagnostic,
                     );
                 }
-                const delay_completed = !will_auto_retry or wait_for_recovery_deadline(
+                const delay_completed = !will_auto_retry or waitForRecoveryDelay(
                     config.cancel_flag,
-                    retry_deadline.?,
+                    recovery_decision.delay_ns,
                 );
                 if (recoveryPauseRequested(config)) {
                     try persistRecoveryCheckpoint(
@@ -3806,7 +3354,6 @@ fn processQueuedPromptLoop(
                         deps,
                         recovery_strategy != null or auto_retry_status_published,
                     );
-                    pending_auto_retry_status = null;
                     try stream_ctx.provisional_statuses.finishTrackedCancelled(
                         deps,
                         stream_ctx.alloc,
@@ -3818,16 +3365,6 @@ fn processQueuedPromptLoop(
                     return;
                 }
                 if (will_auto_retry) {
-                    std.debug.assert(pending_auto_retry_status == null);
-                    pending_auto_retry_status = auto_retry_status(
-                        consumed_attempts + 1,
-                        semantic_limit,
-                        failure_cause,
-                        recovery_decision.strategy,
-                        0,
-                        null,
-                        failure_diagnostic,
-                    );
                     preserved_tool_evidence = effectiveRecoveryToolEvidence(
                         preserved_tool_evidence,
                         null,
@@ -3861,15 +3398,14 @@ fn processQueuedPromptLoop(
                     const exhausted_retryable =
                         stream_ctx.raw_text.items.len == 0 and
                         !stream_ctx.saw_provider_tool_start and
-                        consumed_attempts >= semantic_limit;
+                        semantic_attempt + 1 >= semantic_limit;
                     if (replay_safe or exhausted_retryable) {
                         try pushRouteRecoveryStatus(deps, .{
                             .kind = .terminal_provider_error,
-                            .failed_attempt = consumed_attempts,
+                            .failed_attempt = semantic_attempt + 1,
                             .attempt_limit = semantic_limit,
                             .diagnostic = failure_diagnostic,
                         });
-                        pending_auto_retry_status = null;
                     } else {
                         try pushUnsafeNoRetryStatus(
                             deps,
@@ -3883,11 +3419,10 @@ fn processQueuedPromptLoop(
                 } else if (semantic_attempt > 0) {
                     try pushRouteRecoveryStatus(deps, .{
                         .kind = .terminal_provider_error,
-                        .failed_attempt = consumed_attempts,
+                        .failed_attempt = semantic_attempt + 1,
                         .attempt_limit = semantic_limit,
                         .diagnostic = failure_diagnostic,
                     });
-                    pending_auto_retry_status = null;
                 }
                 try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
                 const failed_assistant_source = stream_ctx.raw_text.items;
@@ -4046,6 +3581,7 @@ fn processQueuedPromptLoop(
                     arena,
                     config,
                     turn_id,
+                    job.provider,
                     response_completion,
                     advertised_dynamic_tool_names,
                     step_ctx,
@@ -4245,7 +3781,7 @@ fn processQueuedPromptLoop(
                             step_ctx,
                         );
                     }
-                    const retry_deadline = try pushAutoRetryStatus(
+                    try pushAutoRetryStatus(
                         deps,
                         semantic_attempt + 1,
                         semantic_limit,
@@ -4253,17 +3789,7 @@ fn processQueuedPromptLoop(
                         decision,
                         diagnostic,
                     );
-                    if (wait_for_recovery_deadline(config.cancel_flag, retry_deadline)) {
-                        std.debug.assert(pending_auto_retry_status == null);
-                        pending_auto_retry_status = auto_retry_status(
-                            semantic_attempt + 2,
-                            semantic_limit,
-                            cause,
-                            decision.strategy,
-                            0,
-                            null,
-                            diagnostic,
-                        );
+                    if (waitForRecoveryDelay(config.cancel_flag, decision.delay_ns)) {
                         preserved_tool_evidence = effectiveRecoveryToolEvidence(
                             preserved_tool_evidence,
                             response_completion,
@@ -4450,7 +3976,7 @@ fn processQueuedPromptLoop(
                             step_ctx,
                         );
                     }
-                    const retry_deadline = try pushAutoRetryStatus(
+                    try pushAutoRetryStatus(
                         deps,
                         semantic_attempt + 1,
                         semantic_limit,
@@ -4458,17 +3984,7 @@ fn processQueuedPromptLoop(
                         decision,
                         diagnostic,
                     );
-                    if (wait_for_recovery_deadline(config.cancel_flag, retry_deadline)) {
-                        std.debug.assert(pending_auto_retry_status == null);
-                        pending_auto_retry_status = auto_retry_status(
-                            semantic_attempt + 2,
-                            semantic_limit,
-                            cause,
-                            decision.strategy,
-                            0,
-                            null,
-                            diagnostic,
-                        );
+                    if (waitForRecoveryDelay(config.cancel_flag, decision.delay_ns)) {
                         preserved_tool_evidence = effectiveRecoveryToolEvidence(
                             preserved_tool_evidence,
                             attempt_completion,
@@ -5173,6 +4689,7 @@ fn processQueuedPromptLoop(
             else
                 partial_assistant,
             .tool_calls = effective_tool_calls,
+            .provider_state_owner = job.provider,
             .provider_state_json = completion.provider_state_json,
         };
 
@@ -5405,6 +4922,7 @@ fn processQueuedPromptLoop(
             &within_turn_suffix,
             if (terminal_provider_completion) null else completion.content,
             effective_tool_calls,
+            job.provider,
             completion.provider_state_json,
         );
 
@@ -6283,25 +5801,8 @@ fn processQueuedPromptLoop(
                 }
             else
                 true;
-            var expected_mcp_runtime_generation: ?u64 = null;
-            const requires_action_validation = requires_legacy_classification or
-                tool_mcp_runtime.isAdvertisedDynamicToolName(
-                    advertised_dynamic_tool_names,
-                    tool_call.name,
-                );
-            if (requires_action_validation) {
-                const validation_failure: ?ToolExecutionResult = switch (try runtime_tool_admission.toolCallValidation(deps, arena, tool_call)) {
-                    .not_registered => null,
-                    .valid => |witness| valid: {
-                        expected_mcp_runtime_generation = witness.mcp_runtime_generation;
-                        break :valid null;
-                    },
-                    .failure => |reason| .{
-                        .model_output = reason,
-                        .status = .failure,
-                    },
-                };
-                if (validation_failure) |execution| {
+            if (requires_legacy_classification) {
+                if (try runtime_tool_admission.registeredToolValidationFailure(deps, arena, tool_call)) |execution| {
                     try terminal_validation_retry.observe(
                         arena,
                         tool_call,
@@ -7090,17 +6591,6 @@ fn processQueuedPromptLoop(
             else
                 null;
 
-            const terminal_lease_transition = try agent_terminal_lease_transition(
-                arena,
-                deps.tool_registry,
-                execution_call,
-            );
-            if (terminal_lease_transition) |transition| switch (transition) {
-                .track => |session_id| try finalization.track_agent_terminal_lease(session_id),
-                .atomic => |session_id| try finalization.track_agent_terminal_lease(session_id),
-                .remove => {},
-            };
-
             debug_trace.eventf("tool", "before_tool_execution", step_ctx, "call_id={s} name={s}", .{ tool_call.id, tool_call.name });
             debug_trace.eventf("tool", "execution_start", step_ctx, "call_id={s} name={s}", .{ tool_call.id, tool_call.name });
             if (deps.tool_activity_recorder) |recorder| {
@@ -7116,7 +6606,6 @@ fn processQueuedPromptLoop(
             }
             const execution_lifecycle_id = types.ToolLifecycleId{ .turn_id = turn_id, .call_id = execution_call.id };
             const execution_is_command = runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, tool_call) == .command;
-            var execution_error: ?anyerror = null;
             var execution = deps.execute_tool_call(deps.ctx, .{
                 .call_allocator = call_allocator,
                 .result_allocator = arena,
@@ -7132,7 +6621,6 @@ fn processQueuedPromptLoop(
                 .live_authority = if (live_authority) |resolved| resolved.authority else null,
                 .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
                 .max_tool_result_bytes = config.max_tool_result_bytes,
-                .expected_mcp_runtime_generation = expected_mcp_runtime_generation,
                 .classification_complete = if (preparation_batch.preparations[tool_call_index]) |preparation|
                     switch (preparation) {
                         .candidate => |candidate| preparedCandidateClassificationComplete(candidate),
@@ -7150,7 +6638,8 @@ fn processQueuedPromptLoop(
                         .model_output = "command cancelled\n",
                     };
                 }
-                execution_error = err;
+                debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind=error err={s}", .{ tool_call.id, tool_call.name, @errorName(err) });
+                debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind=error err={s}", .{ tool_call.id, tool_call.name, @errorName(err) });
                 break :blk ToolExecutionResult{ .status = .failure, .model_output = try deps.format_tool_execution_error(deps.ctx, arena, tool_call.name, err) };
             };
 
@@ -7231,14 +6720,6 @@ fn processQueuedPromptLoop(
                 replay_handed_off = true;
                 finish_trace.finish("interrupted");
                 return;
-            }
-
-            if (execution.status == .success) {
-                if (terminal_lease_transition) |transition| switch (transition) {
-                    .track => {},
-                    .atomic => |session_id| finalization.remove_agent_terminal_lease(session_id),
-                    .remove => |session_id| finalization.remove_agent_terminal_lease(session_id),
-                };
             }
 
             if (deps.tool_activity_recorder) |recorder| {
@@ -7459,13 +6940,8 @@ fn processQueuedPromptLoop(
                 return;
             }
 
-            if (execution_error) |err| {
-                debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind={s} err={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), @errorName(err), safe_tool_output.len });
-                debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind={s} err={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), @errorName(err), safe_tool_output.len });
-            } else {
-                debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), safe_tool_output.len });
-                debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), safe_tool_output.len });
-            }
+            debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), safe_tool_output.len });
+            debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), safe_tool_output.len });
             try runtime_gateway_step.recordSelectedDynamicTool(arena, &selected_dynamic_tool_names, &selected_dynamic_tools, execution);
             try runtime_tool_batch.appendOrdinaryExecutedResult(
                 deps.tool_registry,
@@ -7575,26 +7051,6 @@ fn processQueuedPromptLoop(
             const raw_final = completion.content.?;
             const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
             const rendered = if (final_text.len > 0) final_text else "Done.";
-
-            // Close the model-response race: guidance admitted while this step
-            // was streaming converts the terminal response into an assistant
-            // prefix followed by a new user steering message.
-            if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
-                if (deps.take_steering) |take_steering| {
-                    const guidance = try take_steering(deps.ctx, arena, turn_id);
-                    if (guidance.len > 0) {
-                        try within_turn_suffix.append(arena, .{ .role = .assistant, .content = rendered });
-                        for (guidance) |text| {
-                            try within_turn_suffix.append(arena, .{
-                                .role = .user,
-                                .content = try runtime_execution_memory.steeringMessage(arena, text),
-                            });
-                        }
-                        try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
-                        continue;
-                    }
-                }
-            }
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });

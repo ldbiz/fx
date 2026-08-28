@@ -7,6 +7,8 @@ const session = @import("session.zig");
 const Allocator = std.mem.Allocator;
 const legacy_schema_v1: i64 = 1;
 const legacy_schema_v2: i64 = 2;
+const execution_schema_v3: i64 = 3;
+const max_provider_state_bytes: usize = 4 * 1024 * 1024;
 
 pub const LegacySchemaVersion = enum(u8) {
     v1 = 1,
@@ -89,7 +91,7 @@ fn writeHistoryTurnJson(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writeUserTurnJson(writer, entry.user);
             try writer.writeAll(",\"assistant\":");
             try std.json.Stringify.value(entry.assistant, .{}, writer);
-            if (!entry.execution.isEmpty()) {
+            if (entry.execution.tool_steps.len > 0 or entry.execution.files.len > 0) {
                 try writer.writeAll(",\"execution\":");
                 try writeExecutionMemoryJson(writer, entry.execution);
             }
@@ -165,12 +167,24 @@ fn writeToolCallJson(writer: *std.Io.Writer, tool_call: session.ToolCall) !void 
 }
 
 pub fn writeExecutionMemoryJson(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
-    try writer.writeAll("{\"schema_version\":2,\"tool_steps\":[");
+    try writer.writeAll("{\"schema_version\":3,\"tool_steps\":[");
     for (execution.tool_steps, 0..) |step, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"assistant\":");
         if (step.assistant) |assistant| {
             try std.json.Stringify.value(assistant, .{}, writer);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"provider_state_owner\":");
+        if (step.provider_state_owner) |owner| {
+            try std.json.Stringify.value(@tagName(owner), .{}, writer);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"provider_state_json\":");
+        if (step.provider_state_json) |state| {
+            try std.json.Stringify.value(state, .{}, writer);
         } else {
             try writer.writeAll("null");
         }
@@ -190,11 +204,6 @@ pub fn writeExecutionMemoryJson(writer: *std.Io.Writer, execution: session.Execu
     for (execution.files, 0..) |file, i| {
         if (i > 0) try writer.writeByte(',');
         try writeFileEvidenceJson(writer, file);
-    }
-    try writer.writeAll("],\"steering\":[");
-    for (execution.steering, 0..) |text, i| {
-        if (i > 0) try writer.writeByte(',');
-        try std.json.Stringify.value(text, .{}, writer);
     }
     try writer.writeAll("]}");
 }
@@ -757,7 +766,7 @@ fn parseOptionalExecutionMemory(alloc: Allocator, maybe_value: ?std.json.Value) 
     if (value == .null) return .{};
     const object = try requireObject(value);
     const schema_version: i64 = if (object.get("schema_version")) |version| blk: {
-        if (version != .integer or (version.integer != 1 and version.integer != 2)) {
+        if (version != .integer or (version.integer != 1 and version.integer != 2 and version.integer != 3)) {
             return error.InvalidSessionFormat;
         }
         break :blk version.integer;
@@ -768,10 +777,8 @@ fn parseOptionalExecutionMemory(alloc: Allocator, maybe_value: ?std.json.Value) 
         schema_version,
     );
     errdefer session.freeExecutionMemory(alloc, .{ .tool_steps = tool_steps });
-    const steering = try parseOptionalStringArray(alloc, object.get("steering"));
-    errdefer types.freePermissionFeedback(alloc, steering);
     const files = try parseFileEvidenceSlice(alloc, object.get("files"));
-    return .{ .tool_steps = tool_steps, .files = files, .steering = steering };
+    return .{ .tool_steps = tool_steps, .files = files };
 }
 
 fn parseToolExecutionSteps(
@@ -796,6 +803,16 @@ fn parseToolExecutionSteps(
         const object = try requireObject(item);
         const assistant = try optionalStringDup(alloc, object.get("assistant"));
         errdefer if (assistant) |text| alloc.free(text);
+        const provider_state_owner = if (schema_version >= execution_schema_v3)
+            try parseOptionalProviderStateOwner(object.get("provider_state_owner"))
+        else
+            null;
+        const provider_state_json = if (schema_version >= execution_schema_v3)
+            try optionalStringDup(alloc, object.get("provider_state_json"))
+        else
+            null;
+        errdefer if (provider_state_json) |state| alloc.free(state);
+        try validateProviderState(alloc, provider_state_owner, provider_state_json);
         const tool_calls = try parseToolCallArray(alloc, object.get("tool_calls"));
         errdefer session.freeToolCallSlice(alloc, tool_calls);
         const tool_results = try parsePersistedToolResultArray(
@@ -809,10 +826,33 @@ fn parseToolExecutionSteps(
             .assistant = assistant,
             .tool_calls = tool_calls,
             .tool_results = tool_results,
+            .provider_state_owner = provider_state_owner,
+            .provider_state_json = provider_state_json,
         };
         parsed_count += 1;
     }
     return steps;
+}
+
+fn parseOptionalProviderStateOwner(maybe_value: ?std.json.Value) !?types.ProviderId {
+    const value = maybe_value orelse return error.InvalidSessionFormat;
+    if (value == .null) return null;
+    if (value != .string) return error.InvalidSessionFormat;
+    return std.meta.stringToEnum(types.ProviderId, value.string) orelse error.InvalidSessionFormat;
+}
+
+fn validateProviderState(
+    alloc: Allocator,
+    owner: ?types.ProviderId,
+    state: ?[]const u8,
+) !void {
+    if ((owner == null) != (state == null)) return error.InvalidSessionFormat;
+    const json = state orelse return;
+    if (json.len > max_provider_state_bytes) return error.InvalidSessionFormat;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch
+        return error.InvalidSessionFormat;
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.InvalidSessionFormat;
 }
 
 fn parseToolCallArray(alloc: Allocator, maybe_value: ?std.json.Value) ![]session.ToolCall {
@@ -1087,6 +1127,7 @@ fn freeParsedToolExecutionStep(alloc: Allocator, step: session.ToolExecutionStep
     if (step.assistant) |assistant| alloc.free(assistant);
     session.freeToolCallSlice(alloc, step.tool_calls);
     session.freePersistedToolResults(alloc, step.tool_results);
+    if (step.provider_state_json) |state| alloc.free(state);
 }
 
 fn freeParsedPersistedToolResult(alloc: Allocator, result: session.PersistedToolResult) void {
@@ -1428,7 +1469,7 @@ test "session JSON round-trips images summaries and background commands" {
         .snapshot_path = @constCast("/tmp/fx-session/images/image-1.bin"),
         .snapshot_sha256 = @constCast("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
     }};
-    var completed_tool_names = [_][]u8{ @constCast("glob_files"), @constCast("glob_files") };
+    var completed_tool_names = [_][]u8{ @constCast("list_files"), @constCast("glob_files") };
     var root_user_messages = [_][]u8{ @constCast("first exact request"), @constCast("second exact request") };
     const history = [_]session.HistoryTurn{
         .{ .assistant = .{
@@ -1516,7 +1557,7 @@ test "session JSON round-trips images summaries and background commands" {
     try std.testing.expect(loaded.history[4].interrupted.tool_call == null);
     try std.testing.expectEqualStrings("test tools", loaded.history[5].interrupted.user.text);
     try std.testing.expectEqual(@as(usize, 2), loaded.history[5].interrupted.completed_tool_names.len);
-    try std.testing.expectEqualStrings("glob_files", loaded.history[5].interrupted.completed_tool_names[0]);
+    try std.testing.expectEqualStrings("list_files", loaded.history[5].interrupted.completed_tool_names[0]);
     try std.testing.expectEqualStrings("glob_files", loaded.history[5].interrupted.completed_tool_names[1]);
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -1607,8 +1648,9 @@ test "session JSON round-trips assistant execution memory" {
         .assistant = @constCast("I'll inspect it."),
         .tool_calls = calls[0..],
         .tool_results = results[0..],
+        .provider_state_owner = .deepseek,
+        .provider_state_json = @constCast("[{\"type\":\"deepseek_reasoning\",\"reasoning_content\":\"think\"}]"),
     }};
-    var steering = [_][]u8{@constCast("focus on rendering")};
     var files = [_]session.FileEvidence{.{
         .path = @constCast("src/main.zig"),
         .tool_call_id = @constCast("call_read"),
@@ -1621,7 +1663,7 @@ test "session JSON round-trips assistant execution memory" {
     const history = [_]session.HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("what is main") },
         .assistant = @constCast("main wires the app"),
-        .execution = .{ .tool_steps = steps[0..], .files = files[0..], .steering = steering[0..] },
+        .execution = .{ .tool_steps = steps[0..], .files = files[0..] },
     } }};
 
     const json = try renderSessionJson(alloc, "exec-json", 1, 2, session.ConversationLanguage.literal("en"), "/tmp/workspace", &history, .{});
@@ -1629,15 +1671,17 @@ test "session JSON round-trips assistant execution memory" {
     try std.testing.expect(std.mem.find(u8, json, "\"execution\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"tool_steps\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"files\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"schema_version\":2") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"schema_version\":3") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"provider_state_owner\":\"deepseek\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"permission_feedback\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"steering\":[\"focus on rendering\"]") != null);
 
     var loaded = try parseStoredSession(TestStoredSession, alloc, json);
     defer loaded.deinit(alloc);
     const execution = loaded.history[0].assistant.execution;
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
     try std.testing.expectEqualStrings("I'll inspect it.", execution.tool_steps[0].assistant.?);
+    try std.testing.expectEqual(types.ProviderId.deepseek, execution.tool_steps[0].provider_state_owner.?);
+    try std.testing.expectEqualStrings("[{\"type\":\"deepseek_reasoning\",\"reasoning_content\":\"think\"}]", execution.tool_steps[0].provider_state_json.?);
     try std.testing.expectEqualStrings("call_read", execution.tool_steps[0].tool_calls[0].id);
     try std.testing.expectEqualStrings("read_file", execution.tool_steps[0].tool_results[0].tool_name);
     try std.testing.expectEqual(@as(usize, 54), execution.tool_steps[0].tool_results[0].stored_output_bytes);
@@ -1652,8 +1696,6 @@ test "session JSON round-trips assistant execution memory" {
     try std.testing.expectEqual(@as(usize, 1), execution.files.len);
     try std.testing.expectEqual(.read, execution.files[0].action);
     try std.testing.expect(execution.files[0].model_view_covers_full_file);
-    try std.testing.expectEqual(@as(usize, 1), execution.steering.len);
-    try std.testing.expectEqualStrings("focus on rendering", execution.steering[0]);
 }
 
 const legacy_execution_memory_fixture =
@@ -1919,7 +1961,7 @@ test "legacy interrupted session sanitizes duplicate-key tool arguments" {
         "{\"schema_version\":1,\"id\":\"legacy-interrupted\",\"created_at_ms\":1,\"updated_at_ms\":2," ++
         "\"workspace_root\":\"/tmp/workspace\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[" ++
         "{\"kind\":\"interrupted\",\"user\":{\"text\":\"inspect\",\"images\":[]},\"assistant\":\"working\"," ++
-        "\"tool_call\":{\"id\":\"call_bad\",\"name\":\"glob_files\",\"arguments_json\":\"{\\\"depth\\\":1,\\\"depth\\\":2}\",\"provider_result\":null}," ++
+        "\"tool_call\":{\"id\":\"call_bad\",\"name\":\"list_files\",\"arguments_json\":\"{\\\"depth\\\":1,\\\"depth\\\":2}\",\"provider_result\":null}," ++
         "\"completed_tool_names\":[]}]}";
 
     var loaded = try parseStoredSession(TestStoredSession, std.testing.allocator, json);
@@ -1935,7 +1977,7 @@ test "legacy session JSON rejects ambiguous malformed tool result pairings" {
         "\"output\":\"stale\",\"output_handle\":null,\"preview\":null,\"output_bytes\":5,\"stored_output_bytes\":5," ++
         "\"truncated\":false,\"provider_native\":false,\"created_at_ms\":1}";
     const list_result =
-        "{\"tool_call_id\":\"call_bad\",\"tool_name\":\"glob_files\",\"status\":\"success\"," ++
+        "{\"tool_call_id\":\"call_bad\",\"tool_name\":\"list_files\",\"status\":\"success\"," ++
         "\"output\":\"stale\",\"output_handle\":null,\"preview\":null,\"output_bytes\":5,\"stored_output_bytes\":5," ++
         "\"truncated\":false,\"provider_native\":false,\"created_at_ms\":1}";
     const cases = [_]struct {

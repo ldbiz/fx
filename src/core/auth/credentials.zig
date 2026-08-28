@@ -22,6 +22,8 @@ pub const CatalogPublicOnly = union(enum) {
     authenticated_credential_rejected: Source,
     chatgpt_subscription,
     grok_subscription,
+    deepseek_api_key,
+    deepseek_stored_key,
 
     fn credentialSource(self: CatalogPublicOnly) ?Source {
         return switch (self) {
@@ -31,6 +33,8 @@ pub const CatalogPublicOnly = union(enum) {
             .authenticated_credential_rejected => |source| source,
             .chatgpt_subscription => .chatgpt_subscription,
             .grok_subscription => .grok_subscription,
+            .deepseek_api_key => .deepseek_api_key,
+            .deepseek_stored_key => .deepseek_stored_key,
         };
     }
 };
@@ -44,6 +48,8 @@ pub const CatalogAuthenticatedSource = enum {
     stored_key,
     chatgpt_subscription,
     grok_subscription,
+    deepseek_api_key,
+    deepseek_stored_key,
 
     fn credentialSource(self: CatalogAuthenticatedSource) Source {
         return switch (self) {
@@ -53,6 +59,8 @@ pub const CatalogAuthenticatedSource = enum {
             .stored_key => .stored_key,
             .chatgpt_subscription => .chatgpt_subscription,
             .grok_subscription => .grok_subscription,
+            .deepseek_api_key => .deepseek_api_key,
+            .deepseek_stored_key => .deepseek_stored_key,
         };
     }
 };
@@ -168,6 +176,8 @@ pub fn catalogAccessForCredentialAndAccount(
         .stored_key => .stored_key,
         .chatgpt_subscription => .chatgpt_subscription,
         .grok_subscription => .grok_subscription,
+        .deepseek_api_key => .deepseek_api_key,
+        .deepseek_stored_key => .deepseek_stored_key,
         .fx_login => blk: {
             const team = team_context orelse
                 return .{ .public_only = .fx_login_team_required };
@@ -196,18 +206,23 @@ pub const LoadMode = enum { stored, refresh_if_needed };
 
 const FxLoginRefreshMode = enum { if_needed, force };
 
-pub const missing_credential_message = "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
-pub const missing_interactive_credential_message = "fx needs access to Vercel AI Gateway. Run /login to sign in, /setup to use an API key, or set AI_GATEWAY_API_KEY.";
+pub const missing_credential_message = "Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
+pub const missing_interactive_credential_message = "Fx needs access to Vercel AI Gateway. Run /login to sign in, /setup to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_chatgpt_credential_message = "fx needs a Codex subscription login for this model. Run fx login codex.";
 pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login, open Connections, then choose Codex subscription.";
 pub const missing_grok_credential_message = "fx needs a Grok subscription login for this model. Run fx login grok.";
 pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Run /login, open Connections, then choose Grok subscription.";
-pub const unreadable_store_message = "fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
+pub const missing_deepseek_credential_message = "fx needs a DeepSeek API key for this model. Run fx login deepseek, open /setup → Connections → DeepSeek API key, or set DEEPSEEK_API_KEY.";
+pub const missing_deepseek_interactive_credential_message = "DeepSeek needs an API key. Open /setup → Connections → DeepSeek API key, or set DEEPSEEK_API_KEY and restart fx.";
+pub const unreadable_store_message = "Fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
 
-test "public credential guidance spells fx lowercase" {
-    try std.testing.expect(std.mem.startsWith(u8, missing_credential_message, "fx needs"));
-    try std.testing.expect(std.mem.startsWith(u8, missing_interactive_credential_message, "fx needs"));
-    try std.testing.expect(std.mem.startsWith(u8, unreadable_store_message, "fx could"));
+pub fn missingCredentialMessage(provider: model_provider.ProviderId) []const u8 {
+    return switch (provider) {
+        .gateway => missing_credential_message,
+        .codex => missing_chatgpt_credential_message,
+        .grok => missing_grok_credential_message,
+        .deepseek => missing_deepseek_credential_message,
+    };
 }
 
 pub const Credential = struct {
@@ -297,6 +312,10 @@ pub fn resolveForProvider(
             };
             return .{ .credential = credential };
         },
+        .deepseek => {
+            const credential = try loadDeepSeekCredential(alloc, transport, secret_store, preferred);
+            return .{ .credential = credential };
+        },
         .gateway => {},
     }
     return resolvePreferring(
@@ -304,7 +323,7 @@ pub fn resolveForProvider(
         transport,
         secret_store,
         mode,
-        if (preferred == .chatgpt_subscription or preferred == .grok_subscription) null else preferred,
+        if (preferred == .chatgpt_subscription or preferred == .grok_subscription or preferred == .deepseek_api_key or preferred == .deepseek_stored_key) null else preferred,
     );
 }
 
@@ -320,7 +339,7 @@ pub fn resolvePreferring(
     preferred: ?Source,
 ) !Resolution {
     if (preferred) |source| {
-        if (source != .stored_key or !secret_store.isDisabled()) {
+        if ((source != .stored_key and source != .deepseek_stored_key) or !secret_store.isDisabled()) {
             const chosen = loadPreferredSource(alloc, transport, secret_store, mode, source) catch |err| blk: {
                 if (err == error.OutOfMemory) return err;
                 debug_trace.logf("auth", "preferred source load failed source={t} err={s}", .{ source, @errorName(err) });
@@ -394,6 +413,7 @@ fn loadPreferredSource(
             .stored => loadStoredGrokCredential(alloc),
             .refresh_if_needed => loadGrokCredential(alloc, transport, .if_needed),
         },
+        .deepseek_api_key, .deepseek_stored_key => loadSource(alloc, transport, secret_store, source),
         else => loadSource(alloc, transport, secret_store, source),
     };
 }
@@ -411,7 +431,48 @@ pub fn loadSource(
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
         .chatgpt_subscription => loadChatGptCredential(alloc, transport, .if_needed),
         .grok_subscription => loadGrokCredential(alloc, transport, .if_needed),
+        .deepseek_api_key => loadEnvCredential(alloc, "DEEPSEEK_API_KEY", source),
+        .deepseek_stored_key => loadDeepSeekStoredKeyCredential(alloc, secret_store),
     };
+}
+
+pub fn secretStoreSlot(source: Source) ?host.SecretStoreSlot {
+    return switch (source) {
+        .stored_key => .gateway_api_key,
+        .deepseek_stored_key => .deepseek_api_key,
+        else => null,
+    };
+}
+
+pub fn deleteStoredCredential(
+    alloc: std.mem.Allocator,
+    secret_store: host.SecretStore,
+    source: Source,
+) !bool {
+    const slot = secretStoreSlot(source) orelse return false;
+    if (secret_store.isDisabled()) return false;
+    return secret_store.delete(alloc, slot);
+}
+
+fn loadDeepSeekCredential(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    preferred: ?Source,
+) !?Credential {
+    if (preferred) |source| {
+        if (source == .deepseek_api_key or source == .deepseek_stored_key) {
+            const chosen = loadPreferredSource(alloc, transport, secret_store, .refresh_if_needed, source) catch |err| blk: {
+                if (err == error.OutOfMemory) return err;
+                debug_trace.logf("auth", "preferred deepseek source load failed source={t} err={s}", .{ source, @errorName(err) });
+                break :blk null;
+            };
+            if (chosen) |credential| return credential;
+        }
+    }
+    if (try loadSource(alloc, transport, secret_store, .deepseek_api_key)) |credential| return credential;
+    if (try loadSource(alloc, transport, secret_store, .deepseek_stored_key)) |credential| return credential;
+    return null;
 }
 
 pub fn sourceExists(
@@ -436,20 +497,28 @@ pub fn sourceExists(
         },
         .chatgpt_subscription => chatgpt_oauth.sourceExists(alloc),
         .grok_subscription => grok_oauth.sourceExists(alloc),
-        .stored_key => blk: {
-            if (secret_store.isDisabled()) break :blk false;
-            const stored = secret_store.load(alloc) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => {
-                    debug_trace.logf("auth", "source probe failed source=stored_key err={s}", .{@errorName(err)});
-                    break :blk false;
-                },
-            };
-            const value = stored orelse break :blk false;
-            secret.zeroAndFree(alloc, value);
-            break :blk true;
+        .deepseek_api_key => nonEmptyEnvValue("DEEPSEEK_API_KEY") != null,
+        .deepseek_stored_key => storedSlotExists(alloc, secret_store, .deepseek_api_key),
+        .stored_key => storedSlotExists(alloc, secret_store, .gateway_api_key),
+    };
+}
+
+fn storedSlotExists(
+    alloc: std.mem.Allocator,
+    secret_store: host.SecretStore,
+    slot: host.SecretStoreSlot,
+) !bool {
+    if (secret_store.isDisabled()) return false;
+    const stored = secret_store.load(alloc, slot) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            debug_trace.logf("auth", "source probe failed slot={t} err={s}", .{ slot, @errorName(err) });
+            return false;
         },
     };
+    const value = stored orelse return false;
+    secret.zeroAndFree(alloc, value);
+    return true;
 }
 
 fn loadEnvCredential(
@@ -468,9 +537,25 @@ fn loadStoredKeyCredential(
     alloc: std.mem.Allocator,
     secret_store: host.SecretStore,
 ) !?Credential {
+    return loadStoredCredentialForSlot(alloc, secret_store, .gateway_api_key, .stored_key);
+}
+
+fn loadDeepSeekStoredKeyCredential(
+    alloc: std.mem.Allocator,
+    secret_store: host.SecretStore,
+) !?Credential {
+    return loadStoredCredentialForSlot(alloc, secret_store, .deepseek_api_key, .deepseek_stored_key);
+}
+
+fn loadStoredCredentialForSlot(
+    alloc: std.mem.Allocator,
+    secret_store: host.SecretStore,
+    slot: host.SecretStoreSlot,
+    source: Source,
+) !?Credential {
     if (secret_store.isDisabled()) return null;
-    const value = (try secret_store.load(alloc)) orelse return null;
-    return .{ .token = value, .source = .stored_key };
+    const value = (try secret_store.load(alloc, slot)) orelse return null;
+    return .{ .token = value, .source = source };
 }
 
 fn loadChatGptCredential(
@@ -662,6 +747,8 @@ pub fn sourceLabel(source: Source) []const u8 {
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
         .chatgpt_subscription => "Codex subscription",
         .grok_subscription => "Grok subscription",
+        .deepseek_api_key => "DEEPSEEK_API_KEY",
+        .deepseek_stored_key => "stored DeepSeek API key (" ++ stored_key_backend_label ++ ")",
     };
 }
 
@@ -672,9 +759,20 @@ pub fn sourceRefreshable(source: Source) bool {
 test "stored key label discloses the backend that answered" {
     try std.testing.expect(std.mem.find(u8, sourceLabel(.stored_key), stored_key_backend_label) != null);
     try std.testing.expect(std.mem.find(u8, unreadable_store_message, stored_key_backend_label) != null);
-    for ([_]Source{ .vercel_oidc_token, .ai_gateway_api_key, .fx_login }) |source| {
+    for ([_]Source{ .vercel_oidc_token, .ai_gateway_api_key, .fx_login, .deepseek_api_key }) |source| {
         try std.testing.expect(!std.mem.eql(u8, sourceLabel(source), sourceLabel(.stored_key)));
     }
+}
+
+test "DeepSeek provider resolution accepts environment and stored credential sources" {
+    const selected = model_provider.ProviderId.deepseek;
+    try std.testing.expect(model_provider.authorizesCredential(selected, .deepseek_api_key));
+    try std.testing.expect(model_provider.authorizesCredential(selected, .deepseek_stored_key));
+    try std.testing.expect(!model_provider.authorizesCredential(selected, .ai_gateway_api_key));
+    try std.testing.expectEqualStrings("DEEPSEEK_API_KEY", sourceLabel(.deepseek_api_key));
+    try std.testing.expect(std.mem.find(u8, sourceLabel(.deepseek_stored_key), stored_key_backend_label) != null);
+    try std.testing.expect(!sourceRefreshable(.deepseek_api_key));
+    try std.testing.expect(!sourceRefreshable(.deepseek_stored_key));
 }
 
 test "missing credential messages use surface commands in preferred order" {
@@ -691,6 +789,13 @@ test "missing credential messages use surface commands in preferred order" {
 
     try std.testing.expect(tui_login < tui_setup);
     try std.testing.expect(tui_setup < tui_env);
+}
+
+test "missing credential message follows the selected provider" {
+    try std.testing.expectEqualStrings(missing_credential_message, missingCredentialMessage(.gateway));
+    try std.testing.expectEqualStrings(missing_chatgpt_credential_message, missingCredentialMessage(.codex));
+    try std.testing.expectEqualStrings(missing_grok_credential_message, missingCredentialMessage(.grok));
+    try std.testing.expectEqualStrings(missing_deepseek_credential_message, missingCredentialMessage(.deepseek));
 }
 
 test "credential gateway team prefers team id" {
@@ -864,6 +969,7 @@ const SecretStoreFixture = struct {
             .load_fn = load,
             .store_fn = store,
             .store_interactive_fn = storeInteractive,
+            .delete_fn = delete,
         };
     }
 
@@ -875,6 +981,7 @@ const SecretStoreFixture = struct {
     fn load(
         raw_context: ?*anyopaque,
         alloc: std.mem.Allocator,
+        _: host.SecretStoreSlot,
     ) host.SecretStoreLoadError!?[]u8 {
         const self: *@This() = @ptrCast(@alignCast(raw_context.?));
         self.load_calls += 1;
@@ -886,6 +993,7 @@ const SecretStoreFixture = struct {
     fn store(
         _: ?*anyopaque,
         _: std.mem.Allocator,
+        _: host.SecretStoreSlot,
         _: []const u8,
     ) host.SecretStoreWriteError!void {
         return error.StoredKeyWriteFailed;
@@ -893,6 +1001,15 @@ const SecretStoreFixture = struct {
 
     fn storeInteractive(
         _: ?*anyopaque,
+        _: host.SecretStoreSlot,
+    ) host.SecretStoreWriteError!bool {
+        return false;
+    }
+
+    fn delete(
+        _: ?*anyopaque,
+        _: std.mem.Allocator,
+        _: host.SecretStoreSlot,
     ) host.SecretStoreWriteError!bool {
         return false;
     }

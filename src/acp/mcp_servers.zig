@@ -86,8 +86,7 @@ pub fn parse(alloc: Allocator, params_raw: ?[]const u8) ParseError!OwnedServerCo
     errdefer configs.deinit(alloc);
     try configs.items.ensureTotalCapacity(alloc, servers_value.array.items.len);
     for (servers_value.array.items) |server_value| {
-        var config: mcp_contract.McpServerConfig = undefined;
-        try parseServerInto(&config, alloc, server_value);
+        const config = try parseServer(alloc, server_value);
         configs.items.appendAssumeCapacity(config);
     }
     return configs;
@@ -123,14 +122,14 @@ pub fn prepare(
             config.deinit(alloc);
             return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
-                error.McpConfigScopeMismatch, error.McpConfigAdmissionMismatch => unreachable,
+                error.McpConfigScopeMismatch => unreachable,
             };
         };
     }
-    runtime.connectAllForAcp(builtin_tools.registry);
+    runtime.connectAll(builtin_tools.registry);
 
     for (runtime.servers.items) |server_state| {
-        if (server_state.state == .ready or !server_state.config.required) continue;
+        if (server_state.state == .ready) continue;
         const reason = server_state.last_error orelse @tagName(server_state.state);
         const acp_reason = if (std.mem.startsWith(
             u8,
@@ -175,13 +174,7 @@ pub fn parseErrorMessage(err: ParseError) []const u8 {
     };
 }
 
-// Keep fallible config construction behind caller-owned storage so error
-// returns do not materialize the complete config payload.
-noinline fn parseServerInto(
-    out: *mcp_contract.McpServerConfig,
-    alloc: Allocator,
-    server_value: std.json.Value,
-) ParseError!void {
+fn parseServer(alloc: Allocator, server_value: std.json.Value) ParseError!mcp_contract.McpServerConfig {
     if (server_value != .object) return error.InvalidMcpServer;
     const object = server_value.object;
 
@@ -192,20 +185,13 @@ noinline fn parseServerInto(
 
     if (object.get("type")) |transport_value| {
         if (transport_value != .string) return error.InvalidTransport;
-        const transport: mcp_contract.McpTransport =
-            if (std.mem.eql(u8, transport_value.string, "http"))
-                .http
-            else if (std.mem.eql(u8, transport_value.string, "sse"))
-                .sse
-            else
-                return error.InvalidTransport;
-        return parseRemoteServerInto(
-            out,
-            alloc,
-            object,
-            name_value.string,
-            transport,
-        );
+        if (std.mem.eql(u8, transport_value.string, "http")) {
+            return parseRemoteServer(alloc, object, name_value.string, .http);
+        }
+        if (std.mem.eql(u8, transport_value.string, "sse")) {
+            return parseRemoteServer(alloc, object, name_value.string, .sse);
+        }
+        return error.InvalidTransport;
     }
 
     const command_value = object.get("command") orelse return error.MissingCommand;
@@ -227,7 +213,7 @@ noinline fn parseServerInto(
     const owned_env = try parseEnv(alloc, env_value);
     errdefer mcp_contract.freeEnvVars(alloc, owned_env);
 
-    out.* = .{
+    return .{
         .name = owned_name,
         .source = .acp,
         .scope = .acp_session,
@@ -238,13 +224,12 @@ noinline fn parseServerInto(
     };
 }
 
-fn parseRemoteServerInto(
-    out: *mcp_contract.McpServerConfig,
+fn parseRemoteServer(
     alloc: Allocator,
     object: std.json.ObjectMap,
     name: []const u8,
     transport: mcp_contract.McpTransport,
-) ParseError!void {
+) ParseError!mcp_contract.McpServerConfig {
     const url_value = object.get("url") orelse return error.MissingUrl;
     if (url_value != .string or url_value.string.len == 0) return error.InvalidUrl;
     streamable_http.validateEndpoint(url_value.string) catch return error.InvalidUrl;
@@ -257,7 +242,7 @@ fn parseRemoteServerInto(
     errdefer alloc.free(owned_name);
     const owned_url = try alloc.dupe(u8, url_value.string);
 
-    out.* = .{
+    return .{
         .name = owned_name,
         .source = .acp,
         .scope = .acp_session,

@@ -7,6 +7,7 @@ pub const auth_file_name = "auth.json";
 pub const chatgpt_auth_file_name = "chatgpt-auth.json";
 pub const grok_auth_file_name = "grok-auth.json";
 pub const api_key_file_name = "api-key";
+pub const deepseek_api_key_file_name = "deepseek-api-key";
 pub const sessions_dir_name = "sessions";
 pub const prompt_history_file_name = "history.jsonl";
 pub const usage_file_name = "usage.jsonl";
@@ -66,6 +67,10 @@ pub fn grokAuthPath(alloc: Allocator, home: []const u8) ![]u8 {
 
 pub fn apiKeyPath(alloc: Allocator, home: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ home, root_dir_name, api_key_file_name });
+}
+
+pub fn deepseekApiKeyPath(alloc: Allocator, home: []const u8) ![]u8 {
+    return std.fs.path.join(alloc, &.{ home, root_dir_name, deepseek_api_key_file_name });
 }
 
 pub fn sessionsDir(alloc: Allocator, home: []const u8) ![]u8 {

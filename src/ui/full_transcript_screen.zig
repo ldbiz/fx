@@ -1314,7 +1314,7 @@ test "full projection retains consecutive in-memory tool details" {
     var details = [_]ToolDetailRecord{
         .{
             .entry_id = 1,
-            .tool_name = try alloc.dupe(u8, "glob_files"),
+            .tool_name = try alloc.dupe(u8, "list_files"),
             .arguments_json = try alloc.dupe(u8, "{\"path\":\".\"}"),
             .result = try alloc.dupe(u8, "LIST_FULL_DETAIL_MARKER"),
         },
@@ -8218,8 +8218,6 @@ fn appendCommandProcessPresentation(
     const text = switch (presentation) {
         .exit_code => |code| try std.fmt.allocPrint(alloc, "exit code {d}", .{code}),
         .signal => |signal| try std.fmt.allocPrint(alloc, "signal {d}", .{signal}),
-        .timed_out => try alloc.dupe(u8, "timed out"),
-        .output_capture_failed => try alloc.dupe(u8, "output capture failed"),
     };
     defer alloc.free(text);
     const rendered = try command_output_runtime.renderCommandOutputRecordWithPrimaryGutter(

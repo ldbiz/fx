@@ -9,6 +9,7 @@ const credential_authority = @import("../auth/credential_authority.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const max_provider_state_bytes: usize = 4 * 1024 * 1024;
 
 pub const DurableSessionPreferences = struct {
     provider: model_provider.ProviderId = .gateway,
@@ -1101,6 +1102,14 @@ fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemo
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"assistant\":");
         try writeOptionalDurableBytes(writer, step.assistant);
+        try writer.writeAll(",\"provider_state_owner\":");
+        if (step.provider_state_owner) |owner| {
+            try writeJsonString(writer, @tagName(owner));
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"provider_state_json\":");
+        try writeOptionalDurableBytes(writer, step.provider_state_json);
         try writer.writeAll(",\"tool_calls\":[");
         for (step.tool_calls, 0..) |tool_call, call_index| {
             if (call_index > 0) try writer.writeByte(',');
@@ -1174,11 +1183,6 @@ fn writePersistedToolResult(writer: *std.Io.Writer, result: session.PersistedToo
         writer,
         result.command_process_presentation,
     );
-    try writer.writeAll(",\"terminal_action_presentation\":");
-    try writeOptionalTerminalActionPresentation(
-        writer,
-        result.terminal_action_presentation,
-    );
     try writer.writeByte('}');
 }
 
@@ -1245,51 +1249,6 @@ fn writeOptionalCommandProcessPresentation(
         .exit_code => |exit_code| try writer.print(
             "{{\"kind\":\"exit_code\",\"value\":{d}}}",
             .{exit_code},
-        ),
-        .signal => |signal| try writer.print(
-            "{{\"kind\":\"signal\",\"value\":{d}}}",
-            .{signal},
-        ),
-        .timed_out => try writer.writeAll("{\"kind\":\"timed_out\",\"value\":null}"),
-        .output_capture_failed => try writer.writeAll("{\"kind\":\"output_capture_failed\",\"value\":null}"),
-    }
-}
-
-fn writeOptionalTerminalActionPresentation(
-    writer: *std.Io.Writer,
-    presentation: ?types.TerminalActionPresentation,
-) !void {
-    const value = presentation orelse {
-        try writer.writeAll("null");
-        return;
-    };
-    switch (value) {
-        .returned => |returned| {
-            try writer.writeAll("{\"kind\":\"returned\",\"outcome\":");
-            try writeTerminalReturnPresentation(writer, returned);
-            try writer.writeByte('}');
-        },
-        .failed => |failed| {
-            try writer.writeAll("{\"kind\":\"failed\",\"code\":");
-            try writeJsonString(writer, @tagName(failed));
-            try writer.writeByte('}');
-        },
-    }
-}
-
-fn writeTerminalReturnPresentation(
-    writer: *std.Io.Writer,
-    outcome: types.TerminalReturnPresentation,
-) !void {
-    switch (outcome) {
-        .started, .condition_met, .safety_ceiling, .cancelled => {
-            try writer.writeAll("{\"kind\":");
-            try writeJsonString(writer, @tagName(outcome));
-            try writer.writeAll(",\"value\":null}");
-        },
-        .exited => |code| try writer.print(
-            "{{\"kind\":\"exited\",\"value\":{d}}}",
-            .{code},
         ),
         .signal => |signal| try writer.print(
             "{{\"kind\":\"signal\",\"value\":{d}}}",
@@ -1471,11 +1430,25 @@ fn parseToolSteps(
         if (step.assistant) |assistant| alloc.free(assistant);
         session.freeToolCallSlice(alloc, step.tool_calls);
         session.freePersistedToolResults(alloc, step.tool_results);
+        if (step.provider_state_json) |state| alloc.free(state);
     };
     for (value.array.items, 0..) |step_value, i| {
-        const object = try exactObject(step_value, &.{ "assistant", "tool_calls", "tool_results" });
+        const object = if (schema_version >= 4)
+            try exactObject(step_value, &.{ "assistant", "provider_state_owner", "provider_state_json", "tool_calls", "tool_results" })
+        else
+            try exactObject(step_value, &.{ "assistant", "tool_calls", "tool_results" });
         const assistant = try parseOptionalDurableBytes(alloc, object.get("assistant") orelse return error.InvalidSessionFormat);
         errdefer if (assistant) |owned| alloc.free(owned);
+        const provider_state_owner = if (schema_version >= 4)
+            try parseOptionalProviderId(object.get("provider_state_owner") orelse return error.InvalidSessionFormat)
+        else
+            null;
+        const provider_state_json = if (schema_version >= 4)
+            try parseOptionalDurableBytes(alloc, object.get("provider_state_json") orelse return error.InvalidSessionFormat)
+        else
+            null;
+        errdefer if (provider_state_json) |state| alloc.free(state);
+        try validatePersistedProviderState(alloc, provider_state_owner, provider_state_json);
         const tool_calls = try parseToolCalls(alloc, object.get("tool_calls") orelse return error.InvalidSessionFormat);
         errdefer session.freeToolCallSlice(alloc, tool_calls);
         const tool_results = try parseToolResults(
@@ -1489,10 +1462,28 @@ fn parseToolSteps(
             .assistant = assistant,
             .tool_calls = tool_calls,
             .tool_results = tool_results,
+            .provider_state_owner = provider_state_owner,
+            .provider_state_json = provider_state_json,
         };
         parsed_count += 1;
     }
     return steps;
+}
+
+fn parseOptionalProviderId(value: std.json.Value) !?types.ProviderId {
+    if (value == .null) return null;
+    if (value != .string) return error.InvalidSessionFormat;
+    return model_provider.parse(value.string) orelse error.InvalidSessionFormat;
+}
+
+fn validatePersistedProviderState(alloc: Allocator, owner: ?types.ProviderId, state: ?[]const u8) !void {
+    if ((owner == null) != (state == null)) return error.InvalidSessionFormat;
+    const json = state orelse return;
+    if (json.len > max_provider_state_bytes) return error.InvalidSessionFormat;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch
+        return error.InvalidSessionFormat;
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.InvalidSessionFormat;
 }
 
 fn parseToolCalls(alloc: Allocator, value: std.json.Value) ![]session.ToolCall {
@@ -1648,29 +1639,10 @@ fn parseToolResult(
         "command_output_replay",
         "command_process_presentation",
     };
-    const v4_keys = &.{
-        "tool_call_id",
-        "tool_name",
-        "status",
-        "output",
-        "output_handle",
-        "preview",
-        "output_bytes",
-        "stored_output_bytes",
-        "truncated",
-        "provider_native",
-        "created_at_ms",
-        "permission_feedback",
-        "committed_file_presentation",
-        "command_output_replay",
-        "command_process_presentation",
-        "terminal_action_presentation",
-    };
     const result_shape: ExactVariantObject = switch (schema_version) {
         1 => .{ .object = try exactObject(value, v1_keys), .extended = false },
         2 => try exactVariantObject(value, v2_keys, v2_extended_keys),
-        3 => .{ .object = try exactObject(value, v3_keys), .extended = true },
-        4 => .{ .object = try exactObject(value, v4_keys), .extended = true },
+        3, 4 => .{ .object = try exactObject(value, v3_keys), .extended = true },
         else => return error.InvalidSessionFormat,
     };
     const object = result_shape.object;
@@ -1724,12 +1696,6 @@ fn parseToolResult(
         )
     else
         null;
-    const terminal_action_presentation = if (schema_version >= 4)
-        try parseOptionalTerminalActionPresentation(
-            object.get("terminal_action_presentation") orelse return error.InvalidSessionFormat,
-        )
-    else
-        null;
     return .{
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
@@ -1749,7 +1715,6 @@ fn parseToolResult(
         .committed_file_presentation = committed_file_presentation,
         .command_output_replay = command_output_replay,
         .command_process_presentation = command_process_presentation,
-        .terminal_action_presentation = terminal_action_presentation,
     };
 }
 
@@ -1789,67 +1754,6 @@ fn parseOptionalCommandProcessPresentation(
     if (std.mem.eql(u8, kind, "signal")) {
         const signal = try requireU64(object, "value");
         return .{ .signal = std.math.cast(u32, signal) orelse
-            return error.InvalidSessionFormat };
-    }
-    if (std.mem.eql(u8, kind, "timed_out")) {
-        if (object.get("value").? != .null) return error.InvalidSessionFormat;
-        return .timed_out;
-    }
-    if (std.mem.eql(u8, kind, "output_capture_failed")) {
-        if (object.get("value").? != .null) return error.InvalidSessionFormat;
-        return .output_capture_failed;
-    }
-    return error.InvalidSessionFormat;
-}
-
-fn parseOptionalTerminalActionPresentation(
-    value: std.json.Value,
-) !?types.TerminalActionPresentation {
-    if (value == .null) return null;
-    const object = switch (value) {
-        .object => |object| object,
-        else => return error.InvalidSessionFormat,
-    };
-    const kind = try requireString(object, "kind");
-    if (std.mem.eql(u8, kind, "returned")) {
-        _ = try exactObject(value, &.{ "kind", "outcome" });
-        return .{ .returned = try parseTerminalReturnPresentation(
-            object.get("outcome") orelse return error.InvalidSessionFormat,
-        ) };
-    }
-    if (std.mem.eql(u8, kind, "failed")) {
-        _ = try exactObject(value, &.{ "kind", "code" });
-        const code = std.meta.stringToEnum(
-            types.TerminalFailurePresentation,
-            try requireString(object, "code"),
-        ) orelse return error.InvalidSessionFormat;
-        return .{ .failed = code };
-    }
-    return error.InvalidSessionFormat;
-}
-
-fn parseTerminalReturnPresentation(
-    value: std.json.Value,
-) !types.TerminalReturnPresentation {
-    const object = try exactObject(value, &.{ "kind", "value" });
-    const kind = try requireString(object, "kind");
-    if (std.mem.eql(u8, kind, "started") or
-        std.mem.eql(u8, kind, "condition_met") or
-        std.mem.eql(u8, kind, "safety_ceiling") or
-        std.mem.eql(u8, kind, "cancelled"))
-    {
-        if (object.get("value").? != .null) return error.InvalidSessionFormat;
-        if (std.mem.eql(u8, kind, "started")) return .started;
-        if (std.mem.eql(u8, kind, "condition_met")) return .condition_met;
-        if (std.mem.eql(u8, kind, "safety_ceiling")) return .safety_ceiling;
-        return .cancelled;
-    }
-    if (std.mem.eql(u8, kind, "exited")) {
-        return .{ .exited = std.math.cast(i32, try requireI64(object, "value")) orelse
-            return error.InvalidSessionFormat };
-    }
-    if (std.mem.eql(u8, kind, "signal")) {
-        return .{ .signal = std.math.cast(u32, try requireU64(object, "value")) orelse
             return error.InvalidSessionFormat };
     }
     return error.InvalidSessionFormat;
@@ -2588,7 +2492,7 @@ test "durable state repairs duplicate-key execution and interrupted tool argumen
             .user = .{ .text = @constCast("continue") },
             .tool_call = .{
                 .id = "call_interrupted",
-                .name = "glob_files",
+                .name = "list_files",
                 .arguments_json = duplicate_arguments,
             },
         } },
@@ -2630,6 +2534,76 @@ test "durable state repairs duplicate-key execution and interrupted tool argumen
     try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, interrupted.argument_integrity);
 }
 
+test "durable state round trips tagged provider state and accepts prior execution schemas" {
+    const alloc = std.testing.allocator;
+    var calls = [_]session.ToolCall{.{ .id = "call_1", .name = "read_file", .arguments_json = "{}" }};
+    var results = [_]session.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_1"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("ok"),
+        .output_bytes = 2,
+        .stored_output_bytes = 2,
+    }};
+    var steps = [_]session.ToolExecutionStep{.{
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+        .provider_state_owner = .deepseek,
+        .provider_state_json = @constCast("[{\"type\":\"deepseek_reasoning\",\"reasoning_content\":\"think\"}]"),
+    }};
+    const history = [_]session.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("read") },
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = steps[0..] },
+    } }};
+    const state = DurableSessionState{
+        .id = @constCast("provider-state"),
+        .origin_workspace_root = @constCast("/tmp/origin"),
+        .workspace_root = @constCast("/tmp/workspace"),
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{ .model = @constCast("deepseek-v4-flash"), .effort = .auto, .fast_mode = false },
+        .history = @constCast(history[0..]),
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    };
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    _ = try encodeState(state, &encoded.writer);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"schema_version\":4") != null);
+    var reader = std.Io.Reader.fixed(encoded.written());
+    var decoded = try decodeState(alloc, &reader, .{});
+    defer decoded.deinit(alloc);
+    const step = decoded.history[0].assistant.execution.tool_steps[0];
+    try std.testing.expectEqual(types.ProviderId.deepseek, step.provider_state_owner.?);
+    try std.testing.expectEqualStrings("[{\"type\":\"deepseek_reasoning\",\"reasoning_content\":\"think\"}]", step.provider_state_json.?);
+    const result = step.tool_results[0];
+    try std.testing.expectEqualStrings("call_1", result.tool_call_id);
+    try std.testing.expectEqualStrings("read_file", result.tool_name);
+    try std.testing.expectEqual(session.PersistedToolStatus.success, result.status);
+    try std.testing.expectEqualStrings("ok", result.output);
+
+    const legacy = "{\"kind\":\"assistant\",\"user\":{\"text\":\"u\",\"images\":[]},\"assistant\":\"a\",\"execution\":{\"schema_version\":3,\"tool_steps\":[],\"files\":[]}}";
+    var legacy_json = try std.json.parseFromSlice(std.json.Value, alloc, legacy, .{});
+    defer legacy_json.deinit();
+    const parsed = try parseHistoryTurn(alloc, legacy_json.value);
+    defer session.freeHistoryTurn(alloc, parsed);
+    try std.testing.expectEqual(@as(usize, 0), parsed.assistant.execution.tool_steps.len);
+}
+
+test "durable execution decode frees prior provider state when a later step is malformed" {
+    const alloc = std.testing.allocator;
+    const json =
+        "{\"schema_version\":4,\"tool_steps\":[" ++
+        "{\"assistant\":null,\"provider_state_owner\":\"deepseek\",\"provider_state_json\":\"[{\\\"type\\\":\\\"deepseek_reasoning\\\",\\\"reasoning_content\\\":\\\"think\\\"}]\",\"tool_calls\":[],\"tool_results\":[]}," ++
+        "{\"assistant\":null,\"provider_state_owner\":\"deepseek\",\"provider_state_json\":null,\"tool_calls\":[],\"tool_results\":[]}" ++
+        "],\"files\":[]}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidSessionFormat, parseExecutionMemory(alloc, parsed.value));
+}
+
 test "current history decode rejects ambiguous malformed tool result pairings" {
     var duplicate_calls = [_]session.ToolCall{
         .{ .id = "call_bad", .name = "read_file", .arguments_json = "{]" },
@@ -2656,7 +2630,7 @@ test "current history decode rejects ambiguous malformed tool result pairings" {
     var mismatched_call = [_]session.ToolCall{
         .{ .id = "call_bad", .name = "read_file", .arguments_json = "{]" },
     };
-    var mismatched_result = [_]session.PersistedToolResult{persistedResultForTest("call_bad", "glob_files")};
+    var mismatched_result = [_]session.PersistedToolResult{persistedResultForTest("call_bad", "list_files")};
     try expectMalformedPairRejected(mismatched_call[0..], mismatched_result[0..]);
 }
 
@@ -2855,7 +2829,7 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
     try writeHistoryTurn(&encoded.writer, turn);
-    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"schema_version\":4") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"schema_version\":3") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"permission_feedback\"") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"committed_file_presentation\"") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"command_output_replay\"") != null);
@@ -2912,54 +2886,6 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].committed_file_presentation == null);
     try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].command_output_replay == null);
     try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].command_process_presentation == null);
-}
-
-test "command process presentation codec preserves every terminal cause" {
-    const alloc = std.testing.allocator;
-    const cases = [_]types.CommandProcessPresentation{
-        .{ .exit_code = 7 },
-        .{ .signal = 9 },
-        .timed_out,
-        .output_capture_failed,
-    };
-    for (cases) |case| {
-        var encoded: std.Io.Writer.Allocating = .init(alloc);
-        defer encoded.deinit();
-        try writeOptionalCommandProcessPresentation(&encoded.writer, case);
-
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
-        defer parsed.deinit();
-        try std.testing.expectEqual(
-            case,
-            (try parseOptionalCommandProcessPresentation(parsed.value)).?,
-        );
-    }
-}
-
-test "terminal action presentation codec preserves return and failure causes" {
-    const alloc = std.testing.allocator;
-    const cases = [_]types.TerminalActionPresentation{
-        .{ .returned = .started },
-        .{ .returned = .condition_met },
-        .{ .returned = .safety_ceiling },
-        .{ .returned = .cancelled },
-        .{ .returned = .{ .exited = 7 } },
-        .{ .returned = .{ .signal = 9 } },
-        .{ .failed = .session_not_found },
-        .{ .failed = .capacity_exceeded },
-    };
-    for (cases) |case| {
-        var encoded: std.Io.Writer.Allocating = .init(alloc);
-        defer encoded.deinit();
-        try writeOptionalTerminalActionPresentation(&encoded.writer, case);
-
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
-        defer parsed.deinit();
-        try std.testing.expectEqual(
-            case,
-            (try parseOptionalTerminalActionPresentation(parsed.value)).?,
-        );
-    }
 }
 
 test "durable history rejects unknown fields instead of silently dropping bytes" {
@@ -3383,6 +3309,8 @@ fn expectExecutionMemoryEqual(expected: session.ExecutionMemory, actual: session
     try std.testing.expectEqual(expected.tool_steps.len, actual.tool_steps.len);
     for (expected.tool_steps, actual.tool_steps) |step, got_step| {
         try expectOptionalBytesEqual(step.assistant, got_step.assistant);
+        try std.testing.expectEqual(step.provider_state_owner, got_step.provider_state_owner);
+        try expectOptionalBytesEqual(step.provider_state_json, got_step.provider_state_json);
         try std.testing.expectEqual(step.tool_calls.len, got_step.tool_calls.len);
         for (step.tool_calls, got_step.tool_calls) |call, got_call| try expectToolCallEqual(call, got_call);
         try std.testing.expectEqual(step.tool_results.len, got_step.tool_results.len);

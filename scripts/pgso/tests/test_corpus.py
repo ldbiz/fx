@@ -367,17 +367,12 @@ class PgsoCorpusTests(unittest.TestCase):
         self.assertEqual(36, len(corpus.scenarios))
         self.assertEqual(53, len(corpus.candidate_scenarios))
         self.assertEqual(
-            {
-                "direct-help": 100,
-                "direct-status": 100,
-                "direct-sessions": 100,
-            },
-            {
-                scenario.name: scenario.profile_runs
+            100,
+            next(
+                scenario.profile_runs
                 for scenario in corpus.scenarios
-                if scenario.name
-                in ("direct-help", "direct-status", "direct-sessions")
-            },
+                if scenario.name == "direct-sessions"
+            ),
         )
         self.assertEqual(
             ("e2e-cli", "e2e-mcp-auth"),

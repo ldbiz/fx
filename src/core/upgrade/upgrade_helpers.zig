@@ -18,13 +18,13 @@ fn setRecvTimeout(conn: *std.http.Client.Connection) void {
     std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
 }
 
-pub const cdn_base = "https://releases.fx.sh";
+pub const disabled_message = "this fork does not install upstream binaries; rebuild from source";
 
-pub fn resolveCdnBase() []const u8 {
+pub fn resolveCdnBase() ?[]const u8 {
     if (io_mod.getenv("FX_E2E_UPGRADE_BASE_URL")) |url| {
         if (isLoopbackE2eUpgradeBase(url)) return url;
     }
-    return cdn_base;
+    return null;
 }
 
 fn isLoopbackE2eUpgradeBase(url: []const u8) bool {
@@ -329,8 +329,8 @@ test "E2E upgrade base accepts only explicit IPv4 loopback origins" {
     try std.testing.expect(!isLoopbackE2eUpgradeBase("http://localhost:1234"));
 }
 
-test "production upgrade base uses the fx release domain" {
-    try std.testing.expectEqualStrings("https://releases.fx.sh", resolveCdnBase());
+test "production upgrade base is disabled" {
+    try std.testing.expect(resolveCdnBase() == null);
 }
 
 test "extractChecksumHex parses sha256sum format" {

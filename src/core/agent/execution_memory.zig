@@ -7,6 +7,7 @@ const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;
+const max_provider_state_bytes: usize = 4 * 1024 * 1024;
 
 pub fn makePersistedToolResult(
     alloc: Allocator,
@@ -45,7 +46,6 @@ pub fn makePersistedToolResult(
         .created_at_ms = io_mod.milliTimestamp(),
         .command_output_replay = command_output_replay,
         .command_process_presentation = if (memory) |info| info.command_process_presentation else null,
-        .terminal_action_presentation = if (memory) |info| info.terminal_action_presentation else null,
     };
     if (memory) |info| {
         if (info.committed_file_presentation) |presentation| {
@@ -180,14 +180,22 @@ pub fn appendFileEvidenceForTool(
     const object = parsed.value.object;
 
     const path = switch (action) {
-        .search => stringField(object, "path") orelse stringField(object, "directory") orelse stringField(object, "query"),
+        .rename => stringField(object, "old_path"),
+        .copy => stringField(object, "source"),
+        .search, .list => stringField(object, "path") orelse stringField(object, "directory") orelse stringField(object, "query"),
         else => stringField(object, "path"),
     } orelse return;
+    const new_path = switch (action) {
+        .rename => stringField(object, "new_path"),
+        .copy => stringField(object, "destination"),
+        else => null,
+    };
 
     const evidence = try makeFileEvidence(
         alloc,
         call,
         path,
+        new_path,
         action,
         status,
         memory,
@@ -204,8 +212,15 @@ pub fn markStaleFileEvidence(files: []types.FileEvidence) void {
         var prior_index: usize = 0;
         while (prior_index < i) : (prior_index += 1) {
             if (files[prior_index].action != .read) continue;
-            if (std.mem.eql(u8, files[prior_index].path, file.path)) {
+            if (file.action != .copy and
+                std.mem.eql(u8, files[prior_index].path, file.path))
+            {
                 files[prior_index].stale = true;
+            }
+            if (file.new_path) |new_path| {
+                if (std.mem.eql(u8, files[prior_index].path, new_path)) {
+                    files[prior_index].stale = true;
+                }
             }
         }
     }
@@ -260,6 +275,14 @@ const ChatMessageAdapter = struct {
     fn content(value: Message) ?[]const u8 {
         return value.content;
     }
+
+    fn providerStateOwner(value: Message) ?types.ProviderId {
+        return value.provider_state_owner;
+    }
+
+    fn providerStateJson(value: Message) ?[]const u8 {
+        return value.provider_state_json;
+    }
 };
 
 const MessageAdapter = struct {
@@ -303,6 +326,14 @@ const MessageAdapter = struct {
 
     fn content(value: Message) ?[]const u8 {
         return if (value.content) |content_value| content_value.asText() else null;
+    }
+
+    fn providerStateOwner(_: Message) ?types.ProviderId {
+        return null;
+    }
+
+    fn providerStateJson(_: Message) ?[]const u8 {
+        return null;
     }
 };
 
@@ -409,12 +440,20 @@ fn buildNormalExecutionMemory(
             results.items,
         );
         errdefer types.freeToolCallSlice(alloc, persisted_calls);
+        const provider_state = try dupeValidatedProviderState(
+            alloc,
+            Adapter.providerStateOwner(msg),
+            Adapter.providerStateJson(msg),
+        );
+        errdefer if (provider_state.json) |state| alloc.free(state);
         const owned_results = try results.toOwnedSlice(alloc);
         errdefer types.freePersistedToolResults(alloc, owned_results);
         const step = types.ToolExecutionStep{
             .assistant = assistant,
             .tool_calls = persisted_calls,
             .tool_results = owned_results,
+            .provider_state_owner = provider_state.owner,
+            .provider_state_json = provider_state.json,
         };
         try tool_steps.append(alloc, step);
         i = j;
@@ -456,6 +495,34 @@ pub fn freeTransientToolExecutionStep(
     if (step.assistant) |assistant| alloc.free(assistant);
     types.freeToolCallSlice(alloc, step.tool_calls);
     types.freePersistedToolResults(alloc, step.tool_results);
+    if (step.provider_state_json) |state| alloc.free(state);
+}
+
+const PersistedProviderState = struct {
+    owner: ?types.ProviderId = null,
+    json: ?[]u8 = null,
+};
+
+/// Provider state is opaque to execution memory but must be bounded, valid
+/// JSON, and paired with its route before it can become durable. Redaction is
+/// applied before validation so persisted sessions cannot retain detected
+/// credentials embedded in a provider payload.
+fn dupeValidatedProviderState(
+    alloc: Allocator,
+    owner: ?types.ProviderId,
+    source: ?[]const u8,
+) !PersistedProviderState {
+    const state = source orelse return .{};
+    if (owner == null) return .{};
+    if (state.len > max_provider_state_bytes) return error.ProviderStateTooLarge;
+    const redacted = try redactText(alloc, state);
+    errdefer alloc.free(redacted);
+    if (redacted.len > max_provider_state_bytes) return error.ProviderStateTooLarge;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, redacted, .{}) catch
+        return error.InvalidProviderState;
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.InvalidProviderState;
+    return .{ .owner = owner, .json = redacted };
 }
 
 pub fn freeTransientPersistedToolResult(
@@ -665,12 +732,15 @@ fn makeFileEvidence(
     alloc: Allocator,
     call: ToolCall,
     path_src: []const u8,
+    new_path_src: ?[]const u8,
     action: types.FileEvidenceAction,
     status: types.PersistedToolStatus,
     memory: ?types.ToolResultMemory,
 ) !types.FileEvidence {
     const path = try redactText(alloc, path_src);
     errdefer alloc.free(path);
+    const new_path = if (new_path_src) |value| try redactText(alloc, value) else null;
+    errdefer if (new_path) |value| alloc.free(value);
     const tool_call_id = try durableIdentifier(alloc, call.id);
     errdefer alloc.free(tool_call_id);
     const tool_name = try alloc.dupe(u8, call.name);
@@ -683,6 +753,7 @@ fn makeFileEvidence(
         false;
     return .{
         .path = path,
+        .new_path = new_path,
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
         .action = action,
@@ -698,8 +769,12 @@ fn fileEvidenceActionForTool(tool_name: []const u8) types.FileEvidenceAction {
     if (std.mem.eql(u8, tool_name, "read_file")) return .read;
     if (std.mem.eql(u8, tool_name, "write_file")) return .write;
     if (std.mem.eql(u8, tool_name, "edit_file")) return .edit;
+    if (std.mem.eql(u8, tool_name, "delete_file")) return .delete;
+    if (std.mem.eql(u8, tool_name, "rename_file")) return .rename;
+    if (std.mem.eql(u8, tool_name, "copy_file")) return .copy;
     if (std.mem.eql(u8, tool_name, "grep_files")) return .search;
     if (std.mem.eql(u8, tool_name, "glob_files")) return .search;
+    if (std.mem.eql(u8, tool_name, "list_files")) return .list;
     return .unknown;
 }
 
@@ -711,7 +786,7 @@ fn stringField(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
 
 fn isMutationFileAction(action: types.FileEvidenceAction) bool {
     return switch (action) {
-        .write, .edit => true,
+        .write, .edit, .delete, .rename, .copy => true,
         else => false,
     };
 }
@@ -740,7 +815,12 @@ test "execution memory redacts secret values from arguments results and provider
         .provider_result = "github_pat_abcdefghijklmnop",
     }};
     const messages = [_]ChatMessage{
-        .{ .role = .assistant, .tool_calls = calls[0..] },
+        .{
+            .role = .assistant,
+            .tool_calls = calls[0..],
+            .provider_state_owner = .deepseek,
+            .provider_state_json = "[{\"type\":\"deepseek_reasoning\",\"reasoning_content\":\"think\"}]",
+        },
         .{ .role = .tool, .content = "sk-abcdefghijklmnop xoxb-abcdefghijklmnop", .tool_call_id = "call_secret", .tool_name = "run_command", .tool_result_status = .success },
     };
 
@@ -749,6 +829,11 @@ test "execution memory redacts secret values from arguments results and provider
     try std.testing.expectEqual(@as(usize, 1), memory.tool_steps.len);
     const persisted_call = memory.tool_steps[0].tool_calls[0];
     const persisted_result = memory.tool_steps[0].tool_results[0];
+    try std.testing.expectEqual(types.ProviderId.deepseek, memory.tool_steps[0].provider_state_owner.?);
+    try std.testing.expectEqualStrings(
+        "[{\"type\":\"deepseek_reasoning\",\"reasoning_content\":\"think\"}]",
+        memory.tool_steps[0].provider_state_json.?,
+    );
     const args = persisted_call.arguments_json;
     const secret_needles = [_][]const u8{
         "abcdefghijklmnop",
@@ -768,6 +853,26 @@ test "execution memory redacts secret values from arguments results and provider
     try std.testing.expectEqualStrings("[REDACTED]", parsed.value.object.get("api_key").?.string);
     try std.testing.expect(std.mem.startsWith(u8, parsed.value.object.get("command").?.string, "echo ok"));
     try std.testing.expect(std.mem.find(u8, parsed.value.object.get("command").?.string, "[redacted]") != null);
+}
+
+test "execution memory rejects unowned or malformed provider state" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{.{ .id = "call_1", .name = "read_file", .arguments_json = "{}" }};
+    const result = types.ChatMessage{ .role = .tool, .content = "ok", .tool_call_id = "call_1", .tool_result_status = .success };
+    const unowned = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls, .provider_state_json = "[]" },
+        result,
+    };
+    const memory = try buildNormalChatExecutionMemory(alloc, &unowned);
+    defer types.freeExecutionMemory(alloc, memory);
+    try std.testing.expect(memory.tool_steps[0].provider_state_owner == null);
+    try std.testing.expect(memory.tool_steps[0].provider_state_json == null);
+
+    const malformed = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls, .provider_state_owner = .deepseek, .provider_state_json = "not-json" },
+        result,
+    };
+    try std.testing.expectError(error.InvalidProviderState, buildNormalChatExecutionMemory(alloc, &malformed));
 }
 
 test "execution memory removes token-shaped call ids from JSON and replay" {
@@ -1112,6 +1217,56 @@ test "read evidence trusts typed model coverage instead of output text" {
     try std.testing.expect(!files.items[1].model_view_covers_full_file);
     try std.testing.expect(files.items[2].model_view_covers_full_file);
     try std.testing.expect(!files.items[3].model_view_covers_full_file);
+}
+
+test "copy evidence uses real schema and preserves source read freshness" {
+    const alloc = std.testing.allocator;
+    var files: std.ArrayList(types.FileEvidence) = .empty;
+    defer {
+        for (files.items) |file| freeTransientFileEvidence(alloc, file);
+        files.deinit(alloc);
+    }
+
+    try appendFileEvidenceForTool(
+        alloc,
+        &files,
+        .{
+            .id = "call_source_read",
+            .name = "read_file",
+            .arguments_json = "{\"path\":\"source.txt\"}",
+        },
+        .success,
+        null,
+    );
+    try appendFileEvidenceForTool(
+        alloc,
+        &files,
+        .{
+            .id = "call_destination_read",
+            .name = "read_file",
+            .arguments_json = "{\"path\":\"destination.txt\"}",
+        },
+        .success,
+        null,
+    );
+    try appendFileEvidenceForTool(
+        alloc,
+        &files,
+        .{
+            .id = "call_copy",
+            .name = "copy_file",
+            .arguments_json = "{\"source\":\"source.txt\",\"destination\":\"destination.txt\"}",
+        },
+        .success,
+        null,
+    );
+    markStaleFileEvidence(files.items);
+
+    try std.testing.expectEqual(@as(usize, 3), files.items.len);
+    try std.testing.expectEqualStrings("source.txt", files.items[2].path);
+    try std.testing.expectEqualStrings("destination.txt", files.items[2].new_path.?);
+    try std.testing.expect(!files.items[0].stale);
+    try std.testing.expect(files.items[1].stale);
 }
 
 test "normal execution memory attaches marked permission feedback to its tool result" {

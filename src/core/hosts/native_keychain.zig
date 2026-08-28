@@ -5,6 +5,7 @@ const io_mod = @import("../shared/io.zig");
 const secret = @import("../auth/secret.zig");
 
 pub const service_name = "FX_AI_GATEWAY_API_KEY";
+pub const deepseek_service_name = "FX_DEEPSEEK_API_KEY";
 const mcp_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V1";
 pub const oauth_session_service_name = "FX_OAUTH_SESSION_V1";
 
@@ -38,58 +39,6 @@ pub fn isAvailable() bool {
 pub fn isDisabled() bool {
     const value = io_mod.getenv("FX_DISABLE_KEYCHAIN") orelse return false;
     return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true");
-}
-
-pub fn userDefaultKeychainAvailable(alloc: std.mem.Allocator) Error!bool {
-    return userDefaultKeychainAvailableControlled(alloc, null);
-}
-
-pub fn userDefaultKeychainAvailableCancellable(
-    alloc: std.mem.Allocator,
-    cancel_flag: *const std.atomic.Value(bool),
-) Error!bool {
-    return userDefaultKeychainAvailableControlled(alloc, cancel_flag);
-}
-
-fn userDefaultKeychainAvailableControlled(
-    alloc: std.mem.Allocator,
-    cancel_flag: ?*const std.atomic.Value(bool),
-) Error!bool {
-    if (!isAvailable()) return false;
-    return userDefaultKeychainAvailableForCommand(
-        alloc,
-        &.{ "/usr/bin/security", "default-keychain", "-d", "user" },
-        cancel_flag,
-    );
-}
-
-fn userDefaultKeychainAvailableForCommand(
-    alloc: std.mem.Allocator,
-    argv: []const []const u8,
-    cancel_flag: ?*const std.atomic.Value(bool),
-) Error!bool {
-    const result = runMcpKeychainProcess(
-        alloc,
-        argv,
-        cancel_flag,
-        .limited(4096),
-    ) catch |err| {
-        if (err == error.Cancelled) return error.Cancelled;
-        debug_trace.logf("keychain", "availability failed step=spawn err={s}", .{@errorName(err)});
-        return error.KeychainReadFailed;
-    };
-    defer alloc.free(result.stdout);
-    defer alloc.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| {
-            if (code == 0) return true;
-            debug_trace.logf("keychain", "availability unavailable exit_code={d}", .{code});
-            return false;
-        },
-        else => {},
-    }
-    debug_trace.logf("keychain", "availability failed step=default term={t}", .{result.term});
-    return error.KeychainReadFailed;
 }
 
 /// Returns a slice borrowing `buf`. `USER` stays authoritative when set, because it
@@ -187,8 +136,8 @@ fn loadFromService(alloc: std.mem.Allocator, service: []const u8) !?[]u8 {
     return key;
 }
 
-fn storeArgv(account: []const u8) [8][]const u8 {
-    return .{ "/usr/bin/security", "add-generic-password", "-a", account, "-s", service_name, "-U", "-w" };
+fn storeArgv(account: []const u8, service: []const u8) [8][]const u8 {
+    return .{ "/usr/bin/security", "add-generic-password", "-a", account, "-s", service, "-U", "-w" };
 }
 
 const store_value_script =
@@ -284,17 +233,17 @@ fn storeValueArgv() [3][]const u8 {
 }
 
 /// The returned argv borrows `account_buf`, which must outlive it.
-pub fn storeInteractiveArgv(account_buf: *AccountBuffer) Error![8][]const u8 {
+pub fn storeInteractiveArgv(account_buf: *AccountBuffer, service: []const u8) Error![8][]const u8 {
     if (!isAvailable()) return error.UnsupportedPlatform;
-    return storeArgv(try accountName(account_buf));
+    const account = try accountName(account_buf);
+    return storeArgv(account, service);
 }
 
-pub fn storeInteractive() Error!void {
+pub fn storeInteractiveForService(service: []const u8) Error!void {
     if (!isAvailable()) return error.UnsupportedPlatform;
 
-    // Let macOS prompt for the secret; do not put it in argv.
     var account_buf: AccountBuffer = undefined;
-    const argv = try storeInteractiveArgv(&account_buf);
+    const argv = try storeInteractiveArgv(&account_buf, service);
     var child = std.process.spawn(io_mod.getIo(), .{
         .argv = &argv,
         .stdin = .inherit,
@@ -305,12 +254,28 @@ pub fn storeInteractive() Error!void {
     if (term != .exited or term.exited != 0) return writeFailedTerm("interactive_exit", term);
 }
 
+pub fn storeInteractive() Error!void {
+    return storeInteractiveForService(service_name);
+}
+
 pub fn storeValue(value: []const u8) Error!void {
+    return storeValueForService(service_name, value);
+}
+
+pub fn storeValueForService(service: []const u8, value: []const u8) Error!void {
     if (!isAvailable()) return error.UnsupportedPlatform;
     if (value.len == 0) return error.KeychainWriteFailed;
 
-    if (comptime builtin.os.tag == .macos) return storeValueMac(service_name, value);
+    if (comptime builtin.os.tag == .macos) return storeValueMac(service, value);
     return error.UnsupportedPlatform;
+}
+
+pub fn loadForService(alloc: std.mem.Allocator, service: []const u8) !?[]u8 {
+    return loadFromService(alloc, service);
+}
+
+pub fn deleteStoredService(alloc: std.mem.Allocator, service: []const u8) Error!bool {
+    return deleteServiceItem(alloc, service);
 }
 
 pub fn storeMcpCredentials(value: []const u8) Error!void {
@@ -764,7 +729,7 @@ test "MCP Keychain storage round-trips values beyond the security prompt limit" 
 }
 
 test "Keychain store command has no secret argument" {
-    const argv = storeArgv("user");
+    const argv = storeArgv("user", service_name);
     try std.testing.expectEqualStrings("-w", argv[argv.len - 1]);
     for (argv) |arg| {
         try std.testing.expect(!std.mem.eql(u8, arg, "vca_secret_value"));
@@ -795,35 +760,6 @@ test "cancellable MCP Keychain runner interrupts and reaps a stalled child" {
             &.{ "/bin/sh", "-c", "exec sleep 60" },
             &cancel,
             .limited(16),
-        ),
-    );
-    thread.join();
-    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
-}
-
-test "default Keychain availability probe is cancellable" {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-        return error.SkipZigTest;
-    }
-    const Canceller = struct {
-        flag: *std.atomic.Value(bool),
-
-        fn run(self: *@This()) void {
-            io_mod.sleep(25 * std.time.ns_per_ms);
-            self.flag.store(true, .release);
-        }
-    };
-
-    var cancel = std.atomic.Value(bool).init(false);
-    var canceller = Canceller{ .flag = &cancel };
-    const thread = try std.Thread.spawn(.{}, Canceller.run, .{&canceller});
-    const started_ms = io_mod.milliTimestamp();
-    try std.testing.expectError(
-        error.Cancelled,
-        userDefaultKeychainAvailableForCommand(
-            std.testing.allocator,
-            &.{ "/bin/sh", "-c", "exec sleep 60" },
-            &cancel,
         ),
     );
     thread.join();

@@ -124,7 +124,6 @@ pub const ToolExecutionRequest = struct {
     current_turn_messages: []const ChatMessage = &.{},
     session_grants: []const PermissionGrant,
     live_authority: ?LiveToolAuthority = null,
-    expected_mcp_runtime_generation: ?u64 = null,
     advertised_dynamic_tool_names: []const []const u8,
     max_tool_result_bytes: usize,
     /// The owning agent loop already ran its policy-neutral idempotency and
@@ -142,12 +141,8 @@ pub const ToolExecutionRequest = struct {
 
 pub const DiffEntryPayload = diff.DiffEntryPayload;
 
-pub const ToolCallValidationWitness = struct {
-    mcp_runtime_generation: ?u64 = null,
-};
-
 pub const ToolCallValidationResult = union(enum) {
     not_registered,
-    valid: ToolCallValidationWitness,
+    valid,
     failure: []const u8,
 };

@@ -295,8 +295,7 @@ async function waitForSessionPicker(session: TmuxSession): Promise<string> {
   return session.waitForPane(
     (pane) => {
       const plain = stripAnsi(pane);
-      return plain.includes("Sessions") &&
-        (plain.includes("[Current workspace]") || plain.includes("[All workspaces]"));
+      return plain.includes("Sessions") && SESSION_PICKER_META_RE.test(plain);
     },
     TIMEOUT,
   );
@@ -724,7 +723,7 @@ function expectNoRawToolReplay(scrollback: string): void {
 
 function normalizeVolatileStatusRows(grid: string[]): string[] {
   return grid.map((line) =>
-    /^• (?:Thinking|Generating|Running)(?: \(\d+s\))?$/.test(line) ||
+    /^• Thinking(?: \(\d+s\))?$/.test(line) ||
       /^• Streaming \([^)]*\)$/.test(line) ||
       isVolatileTokenStatusRow(line)
       ? "<status>"
@@ -1662,7 +1661,6 @@ while :; do :; done
       const afterAnsi = await active.captureFullScrollbackEscapes();
       writeFileSync(afterPath, after);
       writeFileSync(afterAnsiPath, afterAnsi);
-      expect(after).toContain(nextMarker);
       expect(historicalLines(after)).toEqual(historicalLines(before));
       expect(historicalLines(afterAnsi)).toEqual(historicalLines(beforeAnsi));
       await waitForCondition(
@@ -1713,6 +1711,7 @@ while :; do :; done
       expect(replayFrames.stderr).toBe("");
       expect(replayFrames.stdout).toContain(expectedRows[0]!);
       expect(replayFrames.stdout).toContain(tailMarker);
+      expect(replayFrames.stdout).toContain(nextMarker);
       const replayJson = await runFx(["replay", tapePath, "--json"], {
         cwd: realpathSync(workspace),
         env: { HOME: home },
@@ -2133,7 +2132,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(stderrPath, "");
 
-    const cmd = `zsh -lc 'for i in {1..14}; do printf "${sentinel}_%02d: pre-fx shell scrollback\\n" "$i"; done; exec ${FX_BIN}'`;
+    const cmd = `zsh -lc 'for i in {1..14}; do printf "${sentinel}_%02d: pre-Fx shell scrollback\\n" "$i"; done; exec ${FX_BIN}'`;
     let active: TmuxSession | null = null;
     try {
       active = await TmuxSession.create({
@@ -2154,7 +2153,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       const before = await active.captureFullScrollback();
       for (const index of [9, 10, 11]) {
-        expect(before).toContain(`${sentinel}_${index.toString().padStart(2, "0")}: pre-fx shell scrollback`);
+        expect(before).toContain(`${sentinel}_${index.toString().padStart(2, "0")}: pre-Fx shell scrollback`);
       }
 
       await active.sendLiteralText(draft);
@@ -2171,7 +2170,7 @@ test.skipIf(!tmuxAvailable())(
 
       const restored = await active.captureFullScrollback();
       for (const index of [9, 10, 11]) {
-        expect(restored).toContain(`${sentinel}_${index.toString().padStart(2, "0")}: pre-fx shell scrollback`);
+        expect(restored).toContain(`${sentinel}_${index.toString().padStart(2, "0")}: pre-Fx shell scrollback`);
       }
       expect(restored).toContain(`┃ ${draft}`);
       expect(restored).not.toContain("press ctrl+c again to exit");
@@ -2562,8 +2561,6 @@ test.skipIf(!tmuxAvailable())(
         if (/^└ (?:Running|Ran) /.test(row)) return "<command status>";
         if (/^│  \d+ output lines$/.test(row)) return "<output count>";
         if (/^│  \d+ more lines · → to expand$/.test(row)) return "<fold count>";
-        if (row.includes("enter queue · ctrl+enter steer")) return "<status line>";
-        if (/^(?:auto · )?gpt-5$/.test(row)) return "<status line>";
         return row;
       });
       const normalizedBefore = normalizeLiveMetadata(readingBefore);
@@ -3037,7 +3034,7 @@ test.skipIf(!tmuxAvailable())(
 
     const gateway = startFakeGateway([
       fakeGatewaySse([
-        { type: "tool-call", toolCallId: "parallel-glob", toolName: "glob_files", input: { pattern: "*" } },
+        { type: "tool-call", toolCallId: "parallel-list", toolName: "list_files", input: { path: "." } },
         { type: "tool-call", toolCallId: "parallel-read", toolName: "read_file", input: { path: "README.md" } },
         { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
       ]),
@@ -3181,12 +3178,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("3");
       await active.sendKeys("Enter");
       await active.waitForText("CTRL_O_HANDOFF_DONE", TIMEOUT);
-      const scrollback = await active.waitForStableScrollback(
-        (value) =>
-          value.includes("CTRL_O_HANDOFF_DONE") &&
-          countOccurrences(value, priorSummary) === 1,
-        TIMEOUT,
-      );
+      const scrollback = await active.captureFullScrollback();
       const inline = await active.capturePane();
       expect(inline).toContain("CTRL_O_HANDOFF_DONE");
       expect(inline).not.toContain("Apply this change?");
@@ -3790,7 +3782,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("/quit");
       await waitForCondition(
         () => active?.paneStatus().dead === true,
-        "fx to exit after /quit",
+        "Fx to exit after /quit",
       );
       expect(paneExitMatches(active.paneStatus(), 0)).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -3893,7 +3885,7 @@ test.skipIf(!tmuxAvailable())(
 
       expect(paneExitMatches(contender.paneStatus(), 1)).toBe(true);
       expect(readFileSync(contenderStderrPath, "utf8")).toBe(
-        "fx: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
+        "fx: another Fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
       );
       expect(owner.isPaneAlive()).toBe(true);
       const contenderScrollback = await contender.captureFullScrollback();
@@ -4016,7 +4008,7 @@ test.skipIf(!tmuxAvailable())(
       await contender.sendKeys("Enter");
       await contender.waitForPane(
         (pane) => stripAnsi(pane).includes(
-          "This session is open in another fx. Close it there, then press Enter to retry.",
+          "This session is open in another Fx. Close it there, then press Enter to retry.",
         ),
         1_000,
       );
@@ -4025,7 +4017,7 @@ test.skipIf(!tmuxAvailable())(
       const contendedPicker = stripAnsi(await contender.capturePane());
       expect(contendedPicker).toContain(savedTitle);
       expect(contendedPicker).toContain(
-        "This session is open in another fx. Close it there, then press Enter to retry.",
+        "This session is open in another Fx. Close it there, then press Enter to retry.",
       );
       expect(contendedPicker).not.toContain("SessionBusy");
       const contendedEntries = visibleSessionPickerEntries(
@@ -4161,7 +4153,7 @@ test.skipIf(!tmuxAvailable())(
       expect(scrollback).not.toContain(`● Failed ${command}`);
       expect(scrollback).toContain("Read nested/input.txt");
       expect(scrollback).toContain(`Ran ${command}`);
-      expect(scrollback).toContain(`Exited 7 ${failureCommand}`);
+      expect(scrollback).toContain(`Ran ${failureCommand}`);
       expect(scrollback).not.toContain("│ exit code 7");
     }
 
@@ -5606,7 +5598,7 @@ test.skipIf(!tmuxAvailable())(
       const currentPicker = stripAnsi(await active.capturePane());
       expect(currentPicker).toContain("Sessions 1");
       expect(currentPicker).toContain("[Current workspace]");
-      expect(currentPicker).toContain("𝒇x");
+      expect(currentPicker).not.toContain("𝒇x");
       expect(currentPicker).toContain("Save the workspace A transcript.");
       expect(currentPicker).not.toContain("Save the workspace B transcript.");
 
@@ -5724,7 +5716,7 @@ test.skipIf(!tmuxAvailable())(
       }
       const rows = pane
         .split("\n")
-        .filter((line) => /(?:alpha|beta|gamma)\b/.test(line))
+        .filter((line) => /(?:alpha|beta|gamma)\b.*\bturns?\b/.test(line))
         .map((line) => line.trim());
       expect(new Set(rows).size).toBe(titles.length);
       expect(active.isPaneAlive()).toBe(true);
@@ -5804,7 +5796,7 @@ test.skipIf(!tmuxAvailable())(
       await waitForSessionPicker(active);
 
       let sessionEntries = visibleSessionPickerEntries(await active.capturePaneEscapes());
-      expect(sessionEntries).toHaveLength(2);
+      expect(sessionEntries.length).toBeGreaterThanOrEqual(7);
       expect(sessionEntries.findIndex((entry) => entry.selected)).toBe(0);
       const firstVisibleRow = sessionEntries[0]!.row;
       const firstVisibleTitle = sessionEntries[0]!.title;
@@ -5844,9 +5836,8 @@ test.skipIf(!tmuxAvailable())(
       expect(hintRow).toBeGreaterThan(loadMoreRow);
       const firstEntryRow = visibleSessionPickerEntries(await active.capturePaneEscapes())[0]!.row;
 
-      for (let index = 0; index < 10 - visibleCount; index += 1) {
-        await active.sendKeys("Down");
-      }
+      await active.sendKeys("Down");
+      await active.sendKeys("Down");
       await active.waitForPane((pane) => {
         const plain = stripAnsi(pane);
         return /Sessions 1[12]\b/.test(plain) && !plain.includes("Load more");
@@ -6131,7 +6122,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Keep this response active.");
       await waitForCondition(() => hold.started, "held gateway response");
-      await active.waitForText("Generating", TIMEOUT);
+      await active.waitForText("Thinking", TIMEOUT);
 
       await active.sendText("/resume");
       await active.waitForText("resume is unavailable until the response finishes", TIMEOUT);

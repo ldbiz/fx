@@ -38,6 +38,19 @@ pub fn run(
     channel: update_target.Channel,
     format: output_contracts.OutputFormat,
 ) RunResult {
+    if (helpers.resolveCdnBase() == null) {
+        return .{
+            .snapshot = .{
+                .current = versionLabel(current.version),
+                .latest = "",
+                .channel = channel.label(),
+                .current_channel = current.channel.label(),
+                .current_revision = current.revision,
+                .status = .failed,
+                .err_message = helpers.disabled_message,
+            },
+        };
+    }
     return runInner(alloc, current, channel, format) catch |err| failureResult(current, channel, err);
 }
 
@@ -177,7 +190,10 @@ fn upgradeWorkerInner(
     progress: *ProgressState,
     show_progress: bool,
 ) !void {
-    const cdn_base = helpers.resolveCdnBase();
+    const cdn_base = helpers.resolveCdnBase() orelse {
+        result.err = .fetch_failed;
+        return;
+    };
     const fetched_target = helpers.fetchTarget(alloc, channel, cdn_base) catch {
         result.err = .fetch_failed;
         return;
@@ -476,6 +492,19 @@ test "completeRunResult maps worker errors and frees latest version" {
             .err = .download_failed,
         }),
     );
+}
+
+test "run refuses without a loopback upgrade base" {
+    const alloc = std.testing.allocator;
+    var result = run(alloc, .{
+        .channel = .stable,
+        .version = "0.2.10",
+        .revision = "0123456789ab",
+    }, .stable, .json);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(output_contracts.UpgradeSnapshot.Status.failed, result.snapshot.status);
+    try std.testing.expectEqualStrings(helpers.disabled_message, result.snapshot.err_message.?);
 }
 
 test "failureResult preserves active error messages" {

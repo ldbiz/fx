@@ -133,7 +133,6 @@ pub const StartupState = struct {
     fast_mode: bool = false,
     fast_mode_source: config_runtime.ConfigSource = .compiled_default,
     slash_menu_categories: bool = true,
-    collapse_tool_calls: bool = false,
     auto_upgrade: bool = true,
     update_channel: update_target.Channel = .stable,
     startup_scrollback: bool = true,
@@ -427,7 +426,6 @@ fn loadStartupStateFromOwnedWorkspace(
         (state.provider == .gateway and state.model_source == .compiled_default);
     state.fast_mode_source = detailed.sources.fast_mode;
     state.slash_menu_categories = settings.slash_menu_categories orelse true;
-    state.collapse_tool_calls = settings.collapse_tool_calls orelse false;
     state.auto_upgrade = settings.auto_upgrade orelse true;
     state.update_channel = settings.update_channel orelse .stable;
     state.startup_scrollback = settings.startup_scrollback orelse true;
@@ -1115,6 +1113,7 @@ fn configuredProviderSelection(
         .gateway => default_model,
         .codex => return error.CodexModelNotSelected,
         .grok => return error.GrokModelNotSelected,
+        .deepseek => "deepseek-v4-flash",
     };
     return .{ .provider = provider, .model = model };
 }
@@ -1151,6 +1150,10 @@ test "startup provider chooses only its provider-scoped model" {
     const grok = try configuredProviderSelection("default/model", &grok_settings);
     try std.testing.expectEqual(model_provider.ProviderId.grok, grok.provider);
     try std.testing.expectEqualStrings("grok-model", grok.model);
+
+    const deepseek = try configuredProviderSelection("default/model", &.{ .provider = .deepseek });
+    try std.testing.expectEqual(model_provider.ProviderId.deepseek, deepseek.provider);
+    try std.testing.expectEqualStrings("deepseek-v4-flash", deepseek.model);
 }
 
 fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) ![]u8 {

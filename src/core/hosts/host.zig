@@ -87,6 +87,13 @@ pub const SecretStoreWriteError = std.mem.Allocator.Error || error{
     StoredKeyWriteFailed,
 };
 
+/// Namespaced slots for profile or keychain stored API keys. Gateway and
+/// DeepSeek keys must never share one physical store entry.
+pub const SecretStoreSlot = enum {
+    gateway_api_key,
+    deepseek_api_key,
+};
+
 pub const SecretStore = struct {
     context: ?*anyopaque = null,
     backend_label: []const u8,
@@ -94,14 +101,22 @@ pub const SecretStore = struct {
     load_fn: *const fn (
         ?*anyopaque,
         std.mem.Allocator,
+        SecretStoreSlot,
     ) SecretStoreLoadError!?[]u8,
     store_fn: *const fn (
         ?*anyopaque,
         std.mem.Allocator,
+        SecretStoreSlot,
         []const u8,
     ) SecretStoreWriteError!void,
     store_interactive_fn: *const fn (
         ?*anyopaque,
+        SecretStoreSlot,
+    ) SecretStoreWriteError!bool,
+    delete_fn: *const fn (
+        ?*anyopaque,
+        std.mem.Allocator,
+        SecretStoreSlot,
     ) SecretStoreWriteError!bool,
 
     pub fn isDisabled(self: SecretStore) bool {
@@ -113,25 +128,38 @@ pub const SecretStore = struct {
     pub fn load(
         self: SecretStore,
         alloc: std.mem.Allocator,
+        slot: SecretStoreSlot,
     ) SecretStoreLoadError!?[]u8 {
-        return self.load_fn(self.context, alloc);
+        return self.load_fn(self.context, alloc, slot);
     }
 
     /// Borrows `value` for this call. The caller retains ownership.
     pub fn store(
         self: SecretStore,
         alloc: std.mem.Allocator,
+        slot: SecretStoreSlot,
         value: []const u8,
     ) SecretStoreWriteError!void {
-        return self.store_fn(self.context, alloc, value);
+        return self.store_fn(self.context, alloc, slot, value);
     }
 
     /// Lets the host collect and store a secret without exposing its bytes to
     /// Core. Returns false when the host has no interactive secret prompt.
     pub fn storeInteractive(
         self: SecretStore,
+        slot: SecretStoreSlot,
     ) SecretStoreWriteError!bool {
-        return self.store_interactive_fn(self.context);
+        return self.store_interactive_fn(self.context, slot);
+    }
+
+    /// Deletes the stored secret when present. Returns true when a stored value
+    /// was removed, false when the slot was already empty.
+    pub fn delete(
+        self: SecretStore,
+        alloc: std.mem.Allocator,
+        slot: SecretStoreSlot,
+    ) SecretStoreWriteError!bool {
+        return self.delete_fn(self.context, alloc, slot);
     }
 };
 
@@ -141,6 +169,7 @@ pub const unavailable_secret_store: SecretStore = .{
     .load_fn = unavailableSecretStoreLoad,
     .store_fn = unavailableSecretStoreWrite,
     .store_interactive_fn = unavailableSecretStoreInteractiveWrite,
+    .delete_fn = unavailableSecretStoreDelete,
 };
 
 fn unavailableSecretStoreIsDisabled(_: ?*anyopaque) bool {
@@ -150,6 +179,7 @@ fn unavailableSecretStoreIsDisabled(_: ?*anyopaque) bool {
 fn unavailableSecretStoreLoad(
     _: ?*anyopaque,
     _: std.mem.Allocator,
+    _: SecretStoreSlot,
 ) SecretStoreLoadError!?[]u8 {
     return null;
 }
@@ -157,6 +187,7 @@ fn unavailableSecretStoreLoad(
 fn unavailableSecretStoreWrite(
     _: ?*anyopaque,
     _: std.mem.Allocator,
+    _: SecretStoreSlot,
     _: []const u8,
 ) SecretStoreWriteError!void {
     return error.StoredKeyWriteFailed;
@@ -164,6 +195,15 @@ fn unavailableSecretStoreWrite(
 
 fn unavailableSecretStoreInteractiveWrite(
     _: ?*anyopaque,
+    _: SecretStoreSlot,
+) SecretStoreWriteError!bool {
+    return false;
+}
+
+fn unavailableSecretStoreDelete(
+    _: ?*anyopaque,
+    _: std.mem.Allocator,
+    _: SecretStoreSlot,
 ) SecretStoreWriteError!bool {
     return false;
 }
@@ -361,12 +401,16 @@ test "unavailable URL opener keeps the manual fallback available" {
 
 test "unavailable secret store reports absence and refuses writes" {
     try std.testing.expect(!unavailable_secret_store.isDisabled());
-    try std.testing.expect((try unavailable_secret_store.load(std.testing.allocator)) == null);
+    try std.testing.expect((try unavailable_secret_store.load(
+        std.testing.allocator,
+        .gateway_api_key,
+    )) == null);
     try std.testing.expectError(
         error.StoredKeyWriteFailed,
-        unavailable_secret_store.store(std.testing.allocator, "secret"),
+        unavailable_secret_store.store(std.testing.allocator, .gateway_api_key, "secret"),
     );
-    try std.testing.expect(!try unavailable_secret_store.storeInteractive());
+    try std.testing.expect(!try unavailable_secret_store.storeInteractive(.gateway_api_key));
+    try std.testing.expect(!try unavailable_secret_store.delete(std.testing.allocator, .deepseek_api_key));
 }
 
 test "unavailable clipboard rejects text and file references" {

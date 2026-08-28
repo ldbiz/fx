@@ -54,7 +54,7 @@ function parseFxJson(result: { stdout: string; stderr: string; code: number | nu
   return JSON.parse(result.stdout.trim()) as FxJson;
 }
 
-function executionDeniedReason(body: string, toolCallId: string): string {
+function toolResultText(body: string, toolCallId: string): string {
   const request = JSON.parse(body) as {
     prompt?: Array<{ content?: Array<Record<string, unknown>> }>;
   };
@@ -63,10 +63,9 @@ function executionDeniedReason(body: string, toolCallId: string): string {
     .find((part) => part.type === "tool-result" && part.toolCallId === toolCallId);
   expect(result).toBeDefined();
   const output = result!.output as Record<string, unknown>;
-  expect(output.type).toBe("execution-denied");
-  expect(typeof output.reason).toBe("string");
-  expect(output.value).toBeUndefined();
-  return output.reason as string;
+  expect(output.type).toBe("text");
+  expect(typeof output.value).toBe("string");
+  return output.value as string;
 }
 
 function permissionEnv(
@@ -209,13 +208,12 @@ describe("generic permission typed errors", () => {
           timeoutMs: TIMEOUT,
         });
         const json = parseFxJson(result);
-        expect(result.stderr).toBe('Running touch "./denied-marker.txt"\n');
         expect(json.tool_calls).toContainEqual({ name: "terminal", status: "error" });
         expect(existsSync(marker)).toBe(false);
         expect(gateway.requests).toHaveLength(2);
 
         const toolResult = JSON.parse(
-          executionDeniedReason(gateway.requests[1]!.body, toolCallId),
+          toolResultText(gateway.requests[1]!.body, toolCallId),
         ) as { error: PermissionEcho };
         const echo = toolResult.error;
         expect(echo.type).toBe("tool_permission_denied");

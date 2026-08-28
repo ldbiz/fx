@@ -2751,6 +2751,8 @@ pub fn appendExecutionMemoryChatMessages(
             .role = .assistant,
             .content = step.assistant,
             .tool_calls = step.tool_calls,
+            .provider_state_owner = step.provider_state_owner,
+            .provider_state_json = step.provider_state_json,
         });
         for (step.tool_results) |result| {
             try messages.append(alloc, .{
@@ -3887,6 +3889,8 @@ test "resume projection replays assistant tool execution memory before final ans
         .assistant = @constCast("I'll read it."),
         .tool_calls = calls[0..],
         .tool_results = results[0..],
+        .provider_state_owner = .deepseek,
+        .provider_state_json = @constCast("[{\"type\":\"deepseek_reasoning\",\"reasoning_content\":\"think\"}]"),
     }};
     var files = [_]FileEvidence{.{
         .path = @constCast("src/main.zig"),
@@ -3916,6 +3920,15 @@ test "resume projection replays assistant tool execution memory before final ans
     try std.testing.expect(std.mem.find(u8, messages.items[3].content.?.asText(), "model_view=full") != null);
     try std.testing.expectEqual(.assistant, messages.items[4].role);
     try std.testing.expectEqualStrings("main wires the app", messages.items[4].content.?.asText());
+
+    var chat_messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer chat_messages.deinit(alloc);
+    try appendHistoryChatMessages(alloc, &chat_messages, &history);
+    try std.testing.expectEqual(core_types.ProviderId.deepseek, chat_messages.items[1].provider_state_owner.?);
+    try std.testing.expectEqualStrings(
+        "[{\"type\":\"deepseek_reasoning\",\"reasoning_content\":\"think\"}]",
+        chat_messages.items[1].provider_state_json.?,
+    );
 }
 
 test "resume projections omit empty terminal assistant after completed execution" {
@@ -4702,7 +4715,7 @@ test "partial-text interrupted history projects partial assistant with closure b
 
 test "completed-tool interrupted history projects summary before marker" {
     const alloc = std.testing.allocator;
-    var completed_tool_names = [_][]u8{ @constCast("glob_files"), @constCast("glob_files") };
+    var completed_tool_names = [_][]u8{ @constCast("list_files"), @constCast("glob_files") };
     const history = [_]HistoryTurn{.{ .interrupted = .{
         .user = .{ .text = @constCast("use all ur tools 1 by 1 - I need u to test them") },
         .completed_tool_names = completed_tool_names[0..],
@@ -4716,7 +4729,7 @@ test "completed-tool interrupted history projects summary before marker" {
     try std.testing.expectEqual(.user, messages.items[0].role);
     try std.testing.expectEqualStrings("use all ur tools 1 by 1 - I need u to test them", messages.items[0].content.?.asText());
     try std.testing.expectEqual(.assistant, messages.items[1].role);
-    try std.testing.expectEqualStrings("Interrupted by user after completing 2 tool calls: glob_files, glob_files.", messages.items[1].content.?.asText());
+    try std.testing.expectEqualStrings("Interrupted by user after completing 2 tool calls: list_files, glob_files.", messages.items[1].content.?.asText());
     try std.testing.expectEqual(.user, messages.items[2].role);
     try std.testing.expect(std.mem.find(u8, messages.items[2].content.?.asText(), "<turn_aborted>") != null);
 
@@ -4731,7 +4744,7 @@ test "completed-tool interrupted history projects summary before marker" {
     try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[0].role);
     try std.testing.expectEqualStrings("use all ur tools 1 by 1 - I need u to test them", chat_messages.items[0].content.?);
     try std.testing.expectEqual(core_types.ChatRole.assistant, chat_messages.items[1].role);
-    try std.testing.expectEqualStrings("Interrupted by user after completing 2 tool calls: glob_files, glob_files.", chat_messages.items[1].content.?);
+    try std.testing.expectEqualStrings("Interrupted by user after completing 2 tool calls: list_files, glob_files.", chat_messages.items[1].content.?);
     try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[2].role);
     try std.testing.expect(std.mem.find(u8, chat_messages.items[2].content.?, "<turn_aborted>") != null);
 }

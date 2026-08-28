@@ -405,6 +405,7 @@ pub fn buildHintLine(
     out: []u8,
 ) []const u8 {
     _ = active_label;
+    _ = stream_active;
 
     var model_buf: [96]u8 = undefined;
     const model_label = compactModelLabel(model, &model_buf);
@@ -418,9 +419,6 @@ pub fn buildHintLine(
     if (!awaiting_permission and queued_count > 0) {
         var queued_buf: [32]u8 = undefined;
         appendStatusSegment(out, &end, std.fmt.bufPrint(&queued_buf, "queued {d}", .{queued_count}) catch "");
-    }
-    if (stream_active and !awaiting_permission) {
-        appendStatusSegment(out, &end, "enter queue");
     }
     const status_limit = @min(@as(usize, width), out.len);
     const show_effort = model_supports_effort and !effort.isDefault();
@@ -944,13 +942,6 @@ test "dev build label drops an unresolved revision" {
     defer std.testing.allocator.free(expected);
 
     try std.testing.expectEqualStrings(expected, label);
-}
-
-test "buildHintLine advertises queue without persistent steering hint while streaming" {
-    var buf: [128]u8 = undefined;
-    const line = buildHintLine(true, false, true, "openai/gpt-5", .ask, 0, null, false, false, .auto, false, .{}, 120, &buf);
-    try std.testing.expect(std.mem.find(u8, line, "enter queue") != null);
-    try std.testing.expect(std.mem.find(u8, line, "ctrl+enter steer") == null);
 }
 
 test "buildHintLine hides effort when it is auto" {

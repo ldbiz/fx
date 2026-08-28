@@ -1375,12 +1375,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         if (routed_credential == null) {
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_request,
-                .message = if (state.provider == .codex)
-                    credentials.missing_chatgpt_credential_message
-                else if (state.provider == .grok)
-                    credentials.missing_grok_credential_message
-                else
-                    credentials.missing_credential_message,
+                .message = credentials.missingCredentialMessage(state.provider),
             });
         }
         break :routed &routed_credential.?;
@@ -1388,12 +1383,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     if (credential.token.len == 0) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
-            .message = if (state.provider == .codex)
-                credentials.missing_chatgpt_credential_message
-            else if (state.provider == .grok)
-                credentials.missing_grok_credential_message
-            else
-                credentials.missing_credential_message,
+            .message = credentials.missingCredentialMessage(state.provider),
         });
     }
     adoptServerCredential(state, credential);
@@ -1571,10 +1561,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 if (!try selectCredentialForProvider(state, session.provider)) {
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
-                        .message = if (session.provider == .codex)
-                            credentials.missing_chatgpt_credential_message
-                        else
-                            credentials.missing_grok_credential_message,
+                        .message = credentials.missingCredentialMessage(session.provider),
                     });
                 }
             }
@@ -1655,12 +1642,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 break :credential resolution.credential orelse
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
-                        .message = if (target == .codex)
-                            credentials.missing_chatgpt_credential_message
-                        else if (target == .grok)
-                            credentials.missing_grok_credential_message
-                        else
-                            credentials.missing_credential_message,
+                        .message = credentials.missingCredentialMessage(target),
                     });
             };
             defer staged_credential.deinit(alloc);

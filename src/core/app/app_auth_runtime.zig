@@ -10,6 +10,7 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
+const oauth_transport = @import("../auth/oauth_transport.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const auth_transition = @import("../auth/auth_transition.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -31,8 +32,31 @@ fn providerFailureMessage(
     intent: ProviderSwitchIntent,
     ordinary: []const u8,
     after_oauth: []const u8,
+    after_api_key: []const u8,
 ) []const u8 {
-    return if (intent == .post_oauth) after_oauth else ordinary;
+    return switch (intent) {
+        .post_oauth => after_oauth,
+        .post_api_key => after_api_key,
+        .manual => ordinary,
+    };
+}
+
+fn missingProviderCredentialMessage(
+    target: model_provider.ProviderId,
+    intent: ProviderSwitchIntent,
+) []const u8 {
+    if (intent == .post_oauth) {
+        return "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged.";
+    }
+    if (intent == .post_api_key) {
+        return "The DeepSeek API key was saved, but the provider could not be activated. The current provider is unchanged.";
+    }
+    return switch (target) {
+        .codex => "Run fx login codex, then try switching again.",
+        .grok => "Run fx login grok, then try switching again.",
+        .deepseek => credentials.missing_deepseek_interactive_credential_message,
+        .gateway => credentials.missing_interactive_credential_message,
+    };
 }
 
 fn selectCatalogModel(
@@ -59,6 +83,7 @@ pub fn Runtime(comptime App: type) type {
                 const required_source: credentials.Source = switch (provider) {
                     .codex => .chatgpt_subscription,
                     .grok => .grok_subscription,
+                    .deepseek => .deepseek_api_key,
                     .gateway => app.auth.credentialSource() orelse .fx_login,
                 };
                 const route_change = app.auth.selectForProvider(app.alloc, provider) catch |err| switch (err) {
@@ -68,6 +93,12 @@ pub fn Runtime(comptime App: type) type {
                 if (route_change) |changed| {
                     applyCredentialChange(app, changed);
                 } else if (!model_provider.authorizesCredential(provider, app.auth.credentialSource())) {
+                    if (provider == .deepseek and comptime runtime_profile.allows(App, .native_auth)) {
+                        prepareApiKeyInputBoundary(app);
+                        app.auth.openDeepSeekApiKeyPickerFromRoot(app.alloc);
+                        app.shell.render_requests.request(.footer);
+                        return false;
+                    }
                     try app.writeDomainNotice(.{
                         .topic = "auth",
                         .tone = .warning,
@@ -75,6 +106,8 @@ pub fn Runtime(comptime App: type) type {
                             credentials.missing_grok_interactive_credential_message
                         else if (provider == .codex)
                             credentials.missing_chatgpt_interactive_credential_message
+                        else if (provider == .deepseek)
+                            credentials.missing_deepseek_interactive_credential_message
                         else
                             credentials.missing_interactive_credential_message,
                     }, true);
@@ -133,7 +166,7 @@ pub fn Runtime(comptime App: type) type {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .warning,
-                        .body = "Usage: /logout [vercel|codex|grok]",
+                        .body = "Usage: /logout [vercel|codex|grok|deepseek]",
                     });
                     return;
                 };
@@ -199,6 +232,52 @@ pub fn Runtime(comptime App: type) type {
                     .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Codex login session found." },
                     .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Codex, but could not confirm the profile directory update." },
                 });
+                return;
+            }
+            if (logout_provider == .deepseek) {
+                const had_stored = credentials.sourceExists(
+                    app.alloc,
+                    app.auth.secretStore(),
+                    .deepseek_stored_key,
+                ) catch false;
+                const deleted_stored = if (had_stored)
+                    credentials.deleteStoredCredential(app.alloc, app.auth.secretStore(), .deepseek_stored_key) catch false
+                else
+                    false;
+                const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterDeepSeekLogout"))
+                    try app.auth.reconcileAfterDeepSeekLogout(app.alloc)
+                else
+                    false;
+                applyCredentialChange(app, changed);
+                if (deleted_stored) {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .neutral,
+                        .body = "Removed the stored DeepSeek API key.",
+                    });
+                } else if (had_stored) {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .warning,
+                        .body = "Could not remove the stored DeepSeek API key. The current source was recalculated.",
+                    });
+                } else if (credentials.sourceExists(
+                    app.alloc,
+                    app.auth.secretStore(),
+                    .deepseek_api_key,
+                ) catch false) {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .neutral,
+                        .body = "DeepSeek is still configured through DEEPSEEK_API_KEY. Unset it and restart fx to disconnect.",
+                    });
+                } else {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .neutral,
+                        .body = "No DeepSeek API key found.",
+                    });
+                }
                 return;
             }
             const result = login_flow.logout(app.alloc, app.auth.oauthTransport()) catch |err| switch (err) {
@@ -280,6 +359,18 @@ pub fn Runtime(comptime App: type) type {
                     .login => try beginSignIn(app, true),
                     .chatgpt_login => try beginChatGptSignIn(app),
                     .grok_login => try beginGrokSignIn(app),
+                    .deepseek_setup => {
+                        if (comptime !runtime_profile.allows(App, .native_auth)) {
+                            try app.writeDomainNotice(.{
+                                .topic = "auth",
+                                .tone = .warning,
+                                .body = "API key setup is unavailable in this WASM session.",
+                            }, true);
+                            return;
+                        }
+                        prepareApiKeyInputBoundary(app);
+                        app.auth.openDeepSeekApiKeyPickerFromRoot(app.alloc);
+                    },
                     .setup => {
                         if (comptime !runtime_profile.allows(App, .native_auth)) {
                             try app.writeDomainNotice(.{
@@ -303,12 +394,10 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn routeAuthPickerByte(app: *App, byte: u8) !bool {
             if (app.auth.signInEntryActive()) {
-                if (byte == '\t') {
-                    _ = app.auth.toggleSignInCodeEntry();
-                } else if (app.auth.signInCodeEntryActive()) {
+                if (app.auth.signInCodeEntryActive()) {
                     switch (byte) {
                         3, 4 => _ = app.auth.popPickerStage(app.alloc),
-                        '\r', '\n' => _ = try app.auth.submitSignInCode(app.alloc),
+                        '\r', '\n' => if (!try app.auth.submitSignInCode(app.alloc)) try openSignInBrowser(app),
                         8, 127 => _ = app.auth.deleteSignInCodeByte(),
                         else => _ = try app.auth.appendSignInCodeByte(app.alloc, byte),
                     }
@@ -347,13 +436,7 @@ pub fn Runtime(comptime App: type) type {
             if (!app.auth.signInEntryActive() and !app.auth.apiKeyEntryActive()) return false;
             return switch (action) {
                 .escape, .remapped_byte => false,
-                .paste_start => blk: {
-                    if (app.auth.signInCodeEntryActive()) break :blk false;
-                    if (!app.auth.toggleSignInCodeEntry()) break :blk true;
-                    app.shell.render_requests.request(.footer);
-                    break :blk false;
-                },
-                .paste_end => !app.auth.signInCodeEntryActive(),
+                .paste_start, .paste_end => !app.auth.signInCodeEntryActive(),
                 else => true,
             };
         }
@@ -482,9 +565,13 @@ pub fn Runtime(comptime App: type) type {
         fn applyApiKeySaveResult(app: *App, result: auth_runtime.ApiKeySaveResult) !void {
             switch (result) {
                 .empty => return,
-                .saved => |changed| {
-                    applyCredentialChange(app, changed);
-                    rememberCredentialSource(app, .stored_key);
+                .saved => |payload| {
+                    applyCredentialChange(app, payload.changed);
+                    const remembered_source: credentials.Source = switch (payload.target) {
+                        .gateway => .stored_key,
+                        .deepseek => .deepseek_stored_key,
+                    };
+                    rememberCredentialSource(app, remembered_source);
                     const body = try std.fmt.allocPrint(
                         app.alloc,
                         "Saved the API key to {s} and made it active.",
@@ -496,16 +583,25 @@ pub fn Runtime(comptime App: type) type {
                         .tone = .neutral,
                         .body = body,
                     }, true);
+                    if (payload.completion == .switch_deepseek) {
+                        try switchProvider(app, .deepseek, false, .post_api_key);
+                    }
                 },
-                .gateway_refused => try app.writeDomainNotice(.{
+                .refused => |key_target| try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "The AI Gateway refused that API key. Nothing was stored.",
+                    .body = switch (key_target) {
+                        .gateway => "The AI Gateway refused that API key. Nothing was stored.",
+                        .deepseek => "DeepSeek refused that API key. Nothing was stored.",
+                    },
                 }, true),
-                .gateway_unavailable => try app.writeDomainNotice(.{
+                .unavailable => |key_target| try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "Could not verify that API key with AI Gateway. Nothing was stored.",
+                    .body = switch (key_target) {
+                        .gateway => "Could not verify that API key with AI Gateway. Nothing was stored.",
+                        .deepseek => "Could not verify that API key with DeepSeek. Nothing was stored.",
+                    },
                 }, true),
                 .store_failed => {
                     const body = try std.fmt.allocPrint(
@@ -705,6 +801,20 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        fn beginDeepSeekApiKeyForProviderSwitch(app: *App) !void {
+            if (comptime !runtime_profile.allows(App, .native_auth)) {
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = "API key setup is unavailable in this WASM session.",
+                }, true);
+                return;
+            }
+            prepareApiKeyInputBoundary(app);
+            app.auth.openDeepSeekApiKeyPickerForProviderSwitch(app.alloc);
+            app.shell.render_requests.request(.footer);
+        }
+
         fn switchProvider(
             app: *App,
             target: model_provider.ProviderId,
@@ -764,6 +874,7 @@ pub fn Runtime(comptime App: type) type {
                             intent,
                             "Provider switching is unavailable until active and queued work finishes.",
                             "Subscription sign-in completed, but provider activation is unavailable until active and queued work finishes. The current provider is unchanged.",
+                            "The DeepSeek API key was saved, but provider activation is unavailable until active and queued work finishes. The current provider is unchanged.",
                         ),
                     }, true);
                     return;
@@ -787,6 +898,7 @@ pub fn Runtime(comptime App: type) type {
                         intent,
                         "Could not prepare the target provider credential. The current provider is unchanged.",
                         "Subscription sign-in completed, but its credential could not be prepared. The current provider is unchanged.",
+                        "The DeepSeek API key was saved, but its credential could not be prepared. The current provider is unchanged.",
                     ),
                 }, true);
                 return;
@@ -800,17 +912,14 @@ pub fn Runtime(comptime App: type) type {
                     try beginGrokSignInForProviderSwitch(app);
                     return;
                 }
+                if (target == .deepseek and allow_login) {
+                    try beginDeepSeekApiKeyForProviderSwitch(app);
+                    return;
+                }
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .warning,
-                    .body = if (intent == .post_oauth)
-                        "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged."
-                    else if (target == .codex)
-                        "Run fx login codex, then try switching again."
-                    else if (target == .grok)
-                        "Run fx login grok, then try switching again."
-                    else
-                        credentials.missing_interactive_credential_message,
+                    .body = missingProviderCredentialMessage(target, intent),
                 }, true);
                 return;
             };
@@ -823,6 +932,7 @@ pub fn Runtime(comptime App: type) type {
                         intent,
                         "The target credential cannot authorize that provider. The current provider is unchanged.",
                         "Subscription sign-in completed, but its credential cannot authorize the provider. The current provider is unchanged.",
+                        "The DeepSeek API key was saved, but its credential cannot authorize the provider. The current provider is unchanged.",
                     ),
                 }, true);
                 return;
@@ -843,6 +953,7 @@ pub fn Runtime(comptime App: type) type {
                         intent,
                         "Could not load the target provider catalog. The current provider is unchanged.",
                         "Subscription sign-in completed, but its model catalog could not be loaded. The current provider is unchanged.",
+                        "The DeepSeek API key was saved, but its model catalog could not be loaded. The current provider is unchanged.",
                     ),
                 }, true);
                 return;
@@ -858,6 +969,7 @@ pub fn Runtime(comptime App: type) type {
                             intent,
                             "The target provider catalog could not be validated. The current provider is unchanged.",
                             "Subscription sign-in completed, but its model catalog could not be validated. The current provider is unchanged.",
+                            "The DeepSeek API key was saved, but its model catalog could not be validated. The current provider is unchanged.",
                         ),
                     }, true);
                     return;
@@ -872,6 +984,7 @@ pub fn Runtime(comptime App: type) type {
                         intent,
                         "The target provider returned no supported models. The current provider is unchanged.",
                         "Subscription sign-in completed, but its model catalog returned no supported models. The current provider is unchanged.",
+                        "The DeepSeek API key was saved, but its model catalog returned no supported models. The current provider is unchanged.",
                     ),
                 }, true);
                 return;
@@ -886,6 +999,7 @@ pub fn Runtime(comptime App: type) type {
                         intent,
                         "Could not load the saved provider model. The current provider is unchanged.",
                         "Subscription sign-in completed, but its saved provider model could not be loaded. The current provider is unchanged.",
+                        "The DeepSeek API key was saved, but its saved provider model could not be loaded. The current provider is unchanged.",
                     ),
                 }, true);
                 return;
@@ -912,6 +1026,7 @@ pub fn Runtime(comptime App: type) type {
                         intent,
                         "Provider switching is unavailable until active and queued work finishes.",
                         "Subscription sign-in completed, but provider activation is unavailable until active and queued work finishes. The current provider is unchanged.",
+                        "The DeepSeek API key was saved, but provider activation is unavailable until active and queued work finishes. The current provider is unchanged.",
                     ),
                 }, true);
                 return;
@@ -1303,6 +1418,22 @@ test "provider switch state machine no-ops rejects busy work and prepares only i
     );
 }
 
+test "DeepSeek provider switch without a credential gives API key guidance" {
+    try std.testing.expectEqualStrings(
+        credentials.missing_deepseek_interactive_credential_message,
+        missingProviderCredentialMessage(.deepseek, .manual),
+    );
+    try std.testing.expect(std.mem.find(
+        u8,
+        missingProviderCredentialMessage(.deepseek, .manual),
+        "DEEPSEEK_API_KEY",
+    ) != null);
+    try std.testing.expectEqualStrings(
+        "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged.",
+        missingProviderCredentialMessage(.deepseek, .post_oauth),
+    );
+}
+
 test "post OAuth catalog selection keeps valid current then saved then first" {
     const entries = [_]model_catalog.ModelCatalogEntry{
         .{ .id = @constCast("first"), .model_type = @constCast("language") },
@@ -1397,7 +1528,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
             switch (provider) {
                 .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
-                .gateway => unreachable,
+                .gateway, .deepseek => unreachable,
             }
 
             try std.testing.expectEqual(@as(usize, 0), app.auth.start_count);
@@ -1460,12 +1591,6 @@ const TestAuth = struct {
     selected_team_adopted: bool = false,
     sign_in_url: ?[]const u8 = null,
     picker_pop_count: usize = 0,
-    sign_in_entry_active: bool = false,
-    sign_in_code_entry_active: bool = false,
-    sign_in_code_toggle_count: usize = 0,
-    sign_in_code_toggle_succeeds: bool = true,
-    sign_in_code_submit_count: usize = 0,
-    sign_in_code_submit_succeeds: bool = true,
 
     fn credentialSource(self: *const TestAuth) ?credentials.Source {
         return self.active_source;
@@ -1488,72 +1613,6 @@ const TestAuth = struct {
     fn popPickerStage(self: *TestAuth, _: std.mem.Allocator) bool {
         self.picker_pop_count += 1;
         return true;
-    }
-
-    fn signInEntryActive(self: *const TestAuth) bool {
-        return self.sign_in_entry_active;
-    }
-
-    fn signInCodeEntryActive(self: *const TestAuth) bool {
-        return self.sign_in_code_entry_active;
-    }
-
-    fn toggleSignInCodeEntry(self: *TestAuth) bool {
-        self.sign_in_code_toggle_count += 1;
-        if (!self.sign_in_code_toggle_succeeds) return false;
-        self.sign_in_code_entry_active = !self.sign_in_code_entry_active;
-        return true;
-    }
-
-    fn submitSignInCode(self: *TestAuth, _: std.mem.Allocator) !bool {
-        self.sign_in_code_submit_count += 1;
-        return self.sign_in_code_submit_succeeds;
-    }
-
-    fn deleteSignInCodeByte(_: *TestAuth) bool {
-        return true;
-    }
-
-    fn appendSignInCodeByte(_: *TestAuth, _: std.mem.Allocator, _: u8) !bool {
-        return true;
-    }
-
-    fn teamPickerActive(_: *const TestAuth) bool {
-        return false;
-    }
-
-    fn deleteTeamQueryByte(_: *TestAuth) bool {
-        return false;
-    }
-
-    fn appendTeamQueryByte(_: *TestAuth, _: std.mem.Allocator, _: u8) !bool {
-        return false;
-    }
-
-    fn apiKeyEntryActive(_: *const TestAuth) bool {
-        return false;
-    }
-
-    fn deleteApiKeyByte(_: *TestAuth) bool {
-        return false;
-    }
-
-    fn appendApiKeyByte(_: *TestAuth, _: std.mem.Allocator, _: u8) !bool {
-        return false;
-    }
-
-    fn pickerView(_: *const TestAuth) auth_runtime.PickerView {
-        return .{
-            .active = false,
-            .available_sources = .empty,
-            .selected_choice = null,
-            .active_source = null,
-            .include_skip = false,
-        };
-    }
-
-    fn beginApiKeySave(_: *TestAuth, _: std.mem.Allocator) auth_runtime.ApiKeySaveStart {
-        return .empty;
     }
 
     fn openTeamPicker(_: *TestAuth, _: std.mem.Allocator, _: *login_flow.TeamSelection) void {}
@@ -1581,8 +1640,21 @@ const TestAuth = struct {
         return self.logout_changed;
     }
 
+    fn reconcileAfterDeepSeekLogout(self: *TestAuth, _: std.mem.Allocator) !bool {
+        self.logout_reconcile_count += 1;
+        return self.logout_changed;
+    }
+
+    fn secretStore(_: *TestAuth) host.SecretStore {
+        return host.unavailable_secret_store;
+    }
+
     fn refreshSourceInventory(self: *TestAuth, _: std.mem.Allocator) !void {
         self.source_inventory_refresh_count += 1;
+    }
+
+    fn oauthTransport(_: *TestAuth) oauth_transport.Provider {
+        return oauth_transport.unavailable_provider;
     }
 
     fn recordCredentialRefreshFailure(self: *TestAuth, source: credentials.Source) void {
@@ -1774,59 +1846,6 @@ test "interactive sign-in opens the owned browser URL through the host" {
     );
 }
 
-test "interactive sign-in routes Tab to the auth-owned manual code toggle" {
-    var app: TestApp = .{};
-    defer app.deinit();
-    app.auth.sign_in_entry_active = true;
-    app.auth.sign_in_url = "https://issuer.test/authorize";
-
-    try std.testing.expect(try Runtime(TestApp).routeAuthPickerByte(&app, '\t'));
-
-    try std.testing.expectEqual(@as(usize, 1), app.auth.sign_in_code_toggle_count);
-    try std.testing.expect(app.auth.sign_in_code_entry_active);
-    try std.testing.expectEqual(@as(usize, 0), app.test_url_opener.calls);
-    try std.testing.expect(app.shell.render_requests.footer_requested);
-}
-
-test "interactive hidden manual code paste reveals entry for the paste owner" {
-    var app: TestApp = .{};
-    defer app.deinit();
-    app.auth.sign_in_entry_active = true;
-
-    try std.testing.expect(!Runtime(TestApp).routeAuthPickerEscapeAction(&app, .paste_start));
-
-    try std.testing.expectEqual(@as(usize, 1), app.auth.sign_in_code_toggle_count);
-    try std.testing.expect(app.auth.sign_in_code_entry_active);
-    try std.testing.expect(app.shell.render_requests.footer_requested);
-}
-
-test "interactive sign-in without manual fallback consumes hidden paste" {
-    var app: TestApp = .{};
-    defer app.deinit();
-    app.auth.sign_in_entry_active = true;
-    app.auth.sign_in_code_toggle_succeeds = false;
-
-    try std.testing.expect(Runtime(TestApp).routeAuthPickerEscapeAction(&app, .paste_start));
-
-    try std.testing.expectEqual(@as(usize, 1), app.auth.sign_in_code_toggle_count);
-    try std.testing.expect(!app.auth.sign_in_code_entry_active);
-    try std.testing.expect(!app.shell.render_requests.footer_requested);
-}
-
-test "interactive manual code entry never reopens the browser on empty submit" {
-    var app: TestApp = .{};
-    defer app.deinit();
-    app.auth.sign_in_entry_active = true;
-    app.auth.sign_in_code_entry_active = true;
-    app.auth.sign_in_code_submit_succeeds = false;
-    app.auth.sign_in_url = "https://issuer.test/authorize";
-
-    try std.testing.expect(try Runtime(TestApp).routeAuthPickerByte(&app, '\r'));
-
-    try std.testing.expectEqual(@as(usize, 1), app.auth.sign_in_code_submit_count);
-    try std.testing.expectEqual(@as(usize, 0), app.test_url_opener.calls);
-}
-
 test "interactive sign-in preserves manual fallback when the host launcher fails" {
     var app: TestApp = .{};
     app.auth.sign_in_url = "https://vercel.test/verify";
@@ -1998,7 +2017,11 @@ test "successful API key save persists even when the live credential is unchange
     defer app.deinit();
     app.auth.active_source = .stored_key;
 
-    try Runtime(TestApp).applyApiKeySaveResult(&app, .{ .saved = false });
+    try Runtime(TestApp).applyApiKeySaveResult(&app, .{ .saved = .{
+        .changed = false,
+        .target = .gateway,
+        .completion = .none,
+    } });
 
     try std.testing.expectEqual(credentials.Source.stored_key, app.auth.active_source.?);
     try std.testing.expectEqual(@as(usize, 1), app.preference_write_count);
@@ -2010,7 +2033,11 @@ test "successful API key save remembers the newly active stored key" {
     defer app.deinit();
     app.auth.active_source = .stored_key;
 
-    try Runtime(TestApp).applyApiKeySaveResult(&app, .{ .saved = true });
+    try Runtime(TestApp).applyApiKeySaveResult(&app, .{ .saved = .{
+        .changed = true,
+        .target = .gateway,
+        .completion = .none,
+    } });
 
     try std.testing.expectEqual(credentials.Source.stored_key, app.auth.active_source.?);
     try std.testing.expectEqual(@as(usize, 1), app.preference_write_count);
@@ -2025,7 +2052,7 @@ test "cancelled login and rejected API key do not persist a source" {
     app.auth.sign_in_transition = .cancelled;
 
     try Runtime(TestApp).collectSignInFacts(&app);
-    try Runtime(TestApp).applyApiKeySaveResult(&app, .gateway_refused);
+    try Runtime(TestApp).applyApiKeySaveResult(&app, .{ .refused = .gateway });
 
     try std.testing.expectEqual(@as(usize, 0), app.preference_write_count);
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, app.auth.active_source.?);
@@ -2107,6 +2134,34 @@ test "logout durability failure still reconciles live auth" {
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Could not confirm durable fx logout.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, login_flow.remote_revocation_warning) != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "current source is unchanged") == null);
+}
+
+test "explicit DeepSeek logout reconciles stored keys and explains environment credentials" {
+    var app: TestApp = .{ .selected_provider = .deepseek };
+    defer app.deinit();
+    app.auth.active_source = .deepseek_api_key;
+
+    try Runtime(TestApp).runLogoutCommand(&app, "deepseek");
+
+    try std.testing.expectEqual(@as(usize, 0), app.auth.source_inventory_refresh_count);
+    try std.testing.expectEqual(@as(usize, 1), app.auth.logout_reconcile_count);
+    try std.testing.expectEqual(@as(usize, 0), app.model_cache.reset_count);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "No DeepSeek API key found.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Signed out of fx.") == null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Could not complete fx logout") == null);
+}
+
+test "bare logout on DeepSeek reconciles without falling through to Vercel logout" {
+    var app: TestApp = .{ .selected_provider = .deepseek };
+    defer app.deinit();
+    app.auth.active_source = .deepseek_api_key;
+
+    try Runtime(TestApp).runLogoutCommand(&app, "");
+
+    try std.testing.expectEqual(@as(usize, 1), app.auth.logout_reconcile_count);
+    try std.testing.expectEqual(@as(usize, 0), app.model_cache.reset_count);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "No DeepSeek API key found.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Signed out of fx.") == null);
 }
 
 test "prompt credential refresh failure is recoverable and detail-free" {

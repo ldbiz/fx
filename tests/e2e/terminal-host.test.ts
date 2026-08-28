@@ -4293,7 +4293,7 @@ test.skipIf(!tmuxAvailable())("tmux recovery rejects a replaced pane without sig
   await waitForExit(replacement);
 }, 25_000);
 
-test.skipIf(!tmuxAvailable())("tmux repeated force-close cycles leave no fx server", async () => {
+test.skipIf(!tmuxAvailable())("tmux repeated force-close cycles leave no Fx server", async () => {
   if (!existsSync("/bin/zsh")) return;
   const home = makeHome();
   const paths = hostPaths(home);
@@ -7865,7 +7865,7 @@ test("force close reports incomplete refresh descendant and shell delivery", asy
   for (const [index, stage] of stages.entries()) {
     const home = makeHome();
     const paths = hostPaths(home);
-    const host = startHost(home, undefined, TMUX_INITIAL_STARTUP_OBSERVATION_BUDGET_MS, {
+    const host = startHost(home, undefined, 200, {
       FX_TERMINAL_TEST_FAIL_SIGNAL_STAGE: stage,
     });
     await waitFor(() => existsSync(paths.socket));

@@ -40,15 +40,14 @@ const test_builtin_gateway = if (builtin.is_test)
     @import("../../builtins/gateway.zig")
 else
     struct {};
+const test_builtin_providers = if (builtin.is_test)
+    @import("../../builtins/providers.zig")
+else
+    struct {};
 const context_contract = @import("../workspace/context_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
-const mcp_command_provider = @import("../mcp/command_provider.zig");
-const mcp_health = @import("../mcp/health.zig");
-const project_config = @import("../mcp/project_config.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
-const text_utils = @import("../shared/text_utils.zig");
-const profile_paths = @import("../shared/profile_paths.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
@@ -70,7 +69,6 @@ pub const Command = union(enum) {
     setup: []const [:0]const u8,
     status: []const [:0]const u8,
     permissions: []const [:0]const u8,
-    mcp: []const [:0]const u8,
     models: []const [:0]const u8,
     provider: []const [:0]const u8,
     doctor: []const [:0]const u8,
@@ -201,13 +199,7 @@ pub const Config = struct {
     mode_registry: mode_registry.Registry,
     tool_set: tool_set_contract.ToolSet,
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
-    inspect_mcp_local_config: mcp_health.InspectLocalConfigFn =
-        mcp_health.inspectLocalConfigUnavailable,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
-    add_mcp_profile_server: mcp_command_provider.AddProfileServerFn =
-        mcp_command_provider.addProfileServerUnavailable,
-    remove_mcp_profile_server: mcp_command_provider.RemoveProfileServerFn =
-        mcp_command_provider.removeProfileServerUnavailable,
     acp_runner: acp_runner.Runner,
 };
 
@@ -427,26 +419,21 @@ fn parseGlobalLaunchArgs(
 /// Startup uses this same surface to select the full runtime configuration
 /// before the allocating parser runs.
 pub fn commandAfterGlobalLaunchArgs(args: []const [:0]const u8) ?[]const u8 {
-    const remaining = argsAfterGlobalLaunchArgs(args);
-    return if (remaining.len > 0) remaining[0] else null;
-}
-
-pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u8 {
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir")) {
             index += 1;
-            if (index >= args.len) return &.{};
+            if (index >= args.len) return null;
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs"))
         {
-            return args[index..];
+            return arg;
         }
         index += 1;
     }
-    return &.{};
+    return null;
 }
 
 pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Command {
@@ -489,7 +476,6 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
             if (command_specs.matchesTopLevel(command_catalog, command, .logout)) return .{ .logout = args[1..] };
         },
         'm' => {
-            if (command_specs.matchesTopLevel(command_catalog, command, .mcp)) return .{ .mcp = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .models)) return .{ .models = args[1..] };
         },
         'p' => {
@@ -703,6 +689,7 @@ fn activateProviderSelection(
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
+            .deepseek => "DeepSeek is already selected.\n",
         });
         return true;
     }
@@ -749,6 +736,7 @@ fn activateProviderSelection(
             switch (target) {
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
+                .deepseek => credentials.missing_deepseek_credential_message,
                 .gateway => "configure a Gateway credential first",
             },
         );
@@ -758,6 +746,7 @@ fn activateProviderSelection(
         try writeProviderActivationError(alloc, deps, caller, switch (target) {
             .codex => "Codex model catalog is unavailable",
             .grok => "Grok model catalog is unavailable",
+            .deepseek => "DeepSeek model catalog is unavailable",
             .gateway => "Gateway model catalog is unavailable",
         });
         return false;
@@ -803,6 +792,7 @@ fn activateProviderSelection(
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
+        .deepseek => unreachable,
         .gateway => unreachable,
     };
     if (caller == .provider_command) {
@@ -810,6 +800,7 @@ fn activateProviderSelection(
             .gateway => "Provider set to Gateway.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
+            .deepseek => "Provider set to DeepSeek.\n",
         });
     }
     return true;
@@ -837,10 +828,7 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         return .handled_failure;
     };
     switch (parsed_launch) {
-        .interactive => |launch| {
-            try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
-            return .{ .interactive = launch };
-        },
+        .interactive => |launch| return .{ .interactive = launch },
         .noninteractive => |value| {
             var noninteractive = value;
             defer noninteractive.deinit(alloc);
@@ -890,7 +878,6 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .ask => |rest| {
-            try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
             const exit_code = try cli_ask.run(alloc, rest, workflowConfigWithLaunchModifiers(cfg, global_args.modifiers), cfg.context_registry, cfg.tool_set);
             return if (exit_code == 0) .handled_success else .handled_failure;
         },
@@ -932,7 +919,7 @@ fn runNonInteractiveWithDeps(
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx login [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: fx login [vercel|codex|grok|deepseek]\n");
                 return .handled_failure;
             };
             // Preserve the original `fx login` behavior for scripts and users.
@@ -986,12 +973,18 @@ fn runNonInteractiveWithDeps(
                     }
                     try writeStdout(deps, "Signed in with Grok.\n");
                 },
+                .deepseek => {
+                    if (!try activateProviderSelection(alloc, cfg, deps, .deepseek, .provider_login)) {
+                        return .handled_failure;
+                    }
+                    try writeStdout(deps, "Signed in with DeepSeek.\n");
+                },
             }
             return .handled_success;
         },
         .logout => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: fx logout [vercel|codex|grok|deepseek]\n");
                 return .handled_failure;
             };
             // Preserve the original `fx logout` behavior for scripts and users.
@@ -1039,14 +1032,32 @@ fn runNonInteractiveWithDeps(
                     },
                 };
             }
+            if (login_provider == .deepseek) {
+                const deleted = credentials.deleteStoredCredential(
+                    alloc,
+                    cfg.secret_store,
+                    .deepseek_stored_key,
+                ) catch false;
+                if (deleted) {
+                    try writeStdout(deps, "Removed the stored DeepSeek API key.\n");
+                } else if (credentials.sourceExists(alloc, cfg.secret_store, .deepseek_api_key) catch false) {
+                    try writeStdout(
+                        deps,
+                        "DeepSeek is still configured through DEEPSEEK_API_KEY. Unset it and restart fx to disconnect.\n",
+                    );
+                } else {
+                    try writeStdout(deps, "No DeepSeek API key found.\n");
+                }
+                return .handled_success;
+            }
             const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
-                    try writeStderr(deps, "fx logout: failed to durably remove saved fx login\n");
+                    try writeStderr(deps, "fx logout: failed to durably remove saved Fx login\n");
                     return .handled_failure;
                 },
             };
             if (result.local_durability_failed) {
-                try writeStderr(deps, "fx logout: failed to durably remove saved fx login\n");
+                try writeStderr(deps, "fx logout: failed to durably remove saved Fx login\n");
             } else {
                 try writeStdout(
                     deps,
@@ -1080,11 +1091,11 @@ fn runNonInteractiveWithDeps(
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <gateway|codex|grok>\n");
+                try writeStderr(deps, "usage: fx provider <gateway|codex|grok|deepseek>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, or grok\n");
+                try writeStderr(deps, "fx provider: expected gateway, codex, grok, or deepseek\n");
                 return .handled_failure;
             };
             return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command))
@@ -1112,18 +1123,13 @@ fn runNonInteractiveWithDeps(
             );
             defer startup.deinit(alloc);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
-            var mcp_inspection = try cfg.inspect_mcp_local_config(
-                alloc,
-                startup.workspace_root,
-            );
-            defer mcp_inspection.deinit(alloc);
+            const mcp_config_diagnostic = try cfg.inspect_mcp_profile_config(alloc);
 
-            var snapshot = statusSnapshotFromStartupWithBuild(startup, .{
+            const snapshot = statusSnapshotFromStartupWithBuild(startup, .{
                 .channel = cfg.build_channel,
                 .version = cfg.version,
                 .revision = cfg.revision,
-            }, mcp_inspection.profile_diagnostic);
-            snapshot.mcp = localMcpView(&mcp_inspection);
+            }, mcp_config_diagnostic);
             if (opts.format == .json) {
                 try writeStatusJsonLine(alloc, deps, snapshot);
                 return .handled_success;
@@ -1156,9 +1162,6 @@ fn runNonInteractiveWithDeps(
             try writeFormattedOutput(deps, text, opts.format);
             return .handled_success;
         },
-        .mcp => |rest| {
-            return runTopLevelMcp(alloc, rest, cfg, deps);
-        },
         .models => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .models, "models", err, rest);
@@ -1180,6 +1183,7 @@ fn runNonInteractiveWithDeps(
                     .gateway => "fx models: Gateway model catalog is unavailable\n",
                     .codex => "fx models: Codex model catalog is unavailable\n",
                     .grok => "fx models: Grok model catalog is unavailable\n",
+                    .deepseek => "fx models: DeepSeek model catalog is unavailable\n",
                 });
                 return .handled_failure;
             };
@@ -1231,24 +1235,17 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             };
 
-            const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-            defer alloc.free(workspace_root);
-            var mcp_inspection = try cfg.inspect_mcp_local_config(
-                alloc,
-                workspace_root,
-            );
-            defer mcp_inspection.deinit(alloc);
+            const mcp_config_diagnostic = try cfg.inspect_mcp_profile_config(alloc);
             var snapshot = try doctor_runtime.collect(
                 alloc,
                 cfg.secret_store,
                 cfg.default_model,
                 cfg.default_agent_step_limit,
-                mcp_inspection.profile_diagnostic,
+                mcp_config_diagnostic,
             );
             defer snapshot.deinit(alloc);
 
-            var output_snapshot = doctorSnapshotFromRuntime(snapshot);
-            output_snapshot.mcp = localMcpView(&mcp_inspection);
+            const output_snapshot = doctorSnapshotFromRuntime(snapshot);
             if (opts.format == .json) {
                 try writeDoctorJsonLine(alloc, deps, output_snapshot);
                 return .handled_success;
@@ -1821,7 +1818,7 @@ fn runPasteSetup(
     }
 
     try writeStderr(deps, "Paste AI Gateway API key (input hidden): ");
-    const stored_interactively = secret_store.storeInteractive() catch {
+    const stored_interactively = secret_store.storeInteractive(.gateway_api_key) catch {
         try writeStderr(deps, "\nfx setup: API key was not saved\n");
         return false;
     };
@@ -1837,7 +1834,7 @@ fn runPasteSetup(
         };
         defer secret.zeroAndFree(alloc, key);
         try writeStderr(deps, "\n");
-        secret_store.store(alloc, key) catch {
+        secret_store.store(alloc, .gateway_api_key, key) catch {
             try writeStderr(deps, "fx setup: API key was not saved\n");
             return false;
         };
@@ -2048,12 +2045,8 @@ fn statusSnapshotFromStartupWithBuild(
         .build_channel = build.channel.label(),
         .build_revision = build.revision,
         .mcp_config_error = switch (mcp_config_diagnostic) {
-            .clear, .warning => null,
+            .clear => null,
             .failed => |err| @errorName(err),
-        },
-        .mcp_config_warning = switch (mcp_config_diagnostic) {
-            .warning => |warning| warning,
-            .clear, .failed => null,
         },
     };
 }
@@ -2117,439 +2110,6 @@ fn writeTopLevelUsage(command_catalog: CommandCatalog, deps: RunDeps, kind: TopL
     try writeStderr(deps, "usage: fx ");
     try writeStderr(deps, command_specs.topLevelUsage(command_catalog, kind));
     try writeStderr(deps, "\n");
-}
-
-const McpCommandRuntime = struct {
-    startup: app_lifecycle.StartupState,
-    runtime: ?*mcp_runtime.McpRuntime,
-
-    fn deinit(self: *McpCommandRuntime, alloc: Allocator) void {
-        if (self.runtime) |runtime| {
-            runtime.deinit();
-            alloc.destroy(runtime);
-        }
-        self.startup.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-fn localMcpView(
-    inspection: *const mcp_health.LocalConfigInspection,
-) output_contracts.McpLocalSnapshot {
-    return .{
-        .servers = inspection.snapshot.servers,
-        .configuration_issues = inspection.snapshot.configuration_issues,
-        .inspection_error = inspection.inspection_error,
-    };
-}
-
-fn loadMcpCommandRuntime(
-    alloc: Allocator,
-    cfg: Config,
-    deps: RunDeps,
-) !McpCommandRuntime {
-    var startup = try deps.load_startup_state_without_credentials(
-        alloc,
-        cfg.default_model,
-        cfg.default_agent_step_limit,
-    );
-    errdefer startup.deinit(alloc);
-    const runtime = try cfg.load_mcp_runtime(
-        alloc,
-        startup.workspace_root,
-        .{ .form = true, .url = true },
-    );
-    return .{ .startup = startup, .runtime = runtime };
-}
-
-fn runTopLevelMcp(
-    alloc: Allocator,
-    rest: []const [:0]const u8,
-    cfg: Config,
-    deps: RunDeps,
-) !RunResult {
-    if (rest.len == 0) {
-        try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-        return .handled_failure;
-    }
-    const operation = rest[0];
-    if (std.mem.eql(u8, operation, "add")) {
-        var tokens: std.ArrayList([]const u8) = .empty;
-        defer tokens.deinit(alloc);
-        try tokens.ensureTotalCapacity(alloc, rest.len - 1);
-        for (rest[1..]) |token| tokens.appendAssumeCapacity(token);
-        const intent = mcp_command_provider.parseAddIntent(tokens.items) catch |err| {
-            if (err == error.McpAddUsage) {
-                try writeMcpAddUsage(deps);
-            } else {
-                try writeMcpOperationFailure(alloc, deps, "add", err);
-            }
-            return .handled_failure;
-        };
-        var result = cfg.add_mcp_profile_server(alloc, intent) catch |err| {
-            try writeMcpOperationFailure(alloc, deps, "add", err);
-            return .handled_failure;
-        };
-        defer result.deinit(alloc);
-        if (result.warning) |warning| try writeMcpProfileWarning(alloc, deps, warning);
-        const name = switch (intent) {
-            .local => |local| local.name,
-            .http => |http| http.name,
-        };
-        try writeMcpProfileMutationSuccess(
-            alloc,
-            deps,
-            "Saved",
-            "to",
-            name,
-            result.profile_path,
-        );
-        return .handled_success;
-    }
-    if (std.mem.eql(u8, operation, "trust")) {
-        const action = parseTopLevelProjectMcpAction(rest[1..]) catch {
-            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-            return .handled_failure;
-        };
-        const workspace_root = io_mod.realpathAlloc(alloc, ".") catch |err| {
-            try writeMcpOperationFailure(alloc, deps, "trust", err);
-            return .handled_failure;
-        };
-        defer alloc.free(workspace_root);
-        var attempt = config_runtime.attemptProjectMcpMutation(
-            alloc,
-            workspace_root,
-            action,
-        );
-        defer attempt.deinit(alloc);
-        switch (attempt) {
-            .failure => |failure| {
-                try writeMcpOperationFailure(alloc, deps, "trust", failure.err);
-                return .handled_failure;
-            },
-            .outcome => {},
-        }
-        try writeMcpTrustSuccess(alloc, deps, workspace_root, action);
-        return .handled_success;
-    }
-    if (std.mem.eql(u8, operation, "path")) {
-        if (rest.len != 1) {
-            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-            return .handled_failure;
-        }
-        const home = deps.getenv(deps.env_ctx, "HOME") orelse {
-            try writeMcpOperationFailure(alloc, deps, "path", error.HomeNotSet);
-            return .handled_failure;
-        };
-        const path = try profile_paths.mcpConfigPath(alloc, home);
-        defer alloc.free(path);
-        var encoded_path = try text_utils.encodeTerminalSafe(alloc, path, 512);
-        defer encoded_path.deinit(alloc);
-        try writeStdout(deps, encoded_path.bytes);
-        try writeStdout(deps, "\n");
-        return .handled_success;
-    }
-    if (std.mem.eql(u8, operation, "remove")) {
-        if (rest.len != 2 or rest[1].len == 0) {
-            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-            return .handled_failure;
-        }
-        var result = cfg.remove_mcp_profile_server(alloc, rest[1]) catch |err| {
-            try writeMcpOperationFailure(alloc, deps, "remove", err);
-            return .handled_failure;
-        };
-        defer result.deinit(alloc);
-        if (result.warning) |warning| try writeMcpProfileWarning(alloc, deps, warning);
-        if (!result.removed) {
-            var encoded_name = try text_utils.encodeTerminalSafe(alloc, rest[1], 160);
-            defer encoded_name.deinit(alloc);
-            var out: std.Io.Writer.Allocating = .init(alloc);
-            defer out.deinit();
-            try out.writer.print(
-                "MCP server '{s}' was not found in the profile.\n",
-                .{encoded_name.bytes},
-            );
-            try writeStderr(deps, out.written());
-            return .handled_failure;
-        }
-        try writeMcpProfileMutationSuccess(
-            alloc,
-            deps,
-            "Removed",
-            "from",
-            rest[1],
-            result.profile_path,
-        );
-        return .handled_success;
-    }
-    if (std.mem.eql(u8, operation, "list")) {
-        const connect = rest.len == 2 and std.mem.eql(u8, rest[1], "--connect");
-        if (rest.len != 1 and !connect) {
-            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-            return .handled_failure;
-        }
-        var loaded = loadMcpCommandRuntime(alloc, cfg, deps) catch |err| {
-            try writeMcpOperationFailure(alloc, deps, "list", err);
-            return .handled_failure;
-        };
-        defer loaded.deinit(alloc);
-        try writeConfigDiagnostics(alloc, deps, loaded.startup.config_diagnostics);
-        const listing = if (loaded.runtime) |runtime| listing: {
-            if (connect) {
-                runtime.connectAll(cfg.tool_set.registry);
-            } else {
-                try runtime.loadStoredCredentialsForHealthSnapshot();
-            }
-            break :listing try runtime.listServersAndTools(alloc);
-        } else try alloc.dupe(u8, "No MCP servers configured.\n");
-        defer alloc.free(listing);
-        try writeStdout(deps, listing);
-        return .handled_success;
-    }
-    if (std.mem.eql(u8, operation, "auth")) {
-        if (rest.len != 2 or rest[1].len == 0) {
-            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-            return .handled_failure;
-        }
-        var loaded = loadMcpCommandRuntime(alloc, cfg, deps) catch |err| {
-            try writeMcpOperationFailure(alloc, deps, "auth", err);
-            return .handled_failure;
-        };
-        defer loaded.deinit(alloc);
-        try writeConfigDiagnostics(alloc, deps, loaded.startup.config_diagnostics);
-        const runtime = loaded.runtime orelse {
-            try writeMcpOperationFailure(alloc, deps, "auth", error.McpServerNotFound);
-            return .handled_failure;
-        };
-        var opener = cfg.url_opener;
-        var result = runtime.authenticateServer(
-            rest[1],
-            &opener,
-            openTopLevelMcpUrl,
-        ) catch |err| {
-            try writeMcpOperationFailure(alloc, deps, "auth", err);
-            return .handled_failure;
-        };
-        defer result.deinit();
-        switch (result) {
-            .authenticated => |authenticated| {
-                var encoded_name = try text_utils.encodeTerminalSafe(alloc, rest[1], 160);
-                defer encoded_name.deinit(alloc);
-                var out: std.Io.Writer.Allocating = .init(alloc);
-                defer out.deinit();
-                try out.writer.print("Authenticated MCP server '{s}'.", .{encoded_name.bytes});
-                if (authenticated.repaired_entries > 0) {
-                    try out.writer.print(
-                        " Removed {d} unreadable MCP credential {s}.",
-                        .{
-                            authenticated.repaired_entries,
-                            if (authenticated.repaired_entries == 1) "entry" else "entries",
-                        },
-                    );
-                }
-                try out.writer.writeByte('\n');
-                try writeStdout(deps, out.written());
-                return .handled_success;
-            },
-            .issuer_mismatch => {
-                try writeMcpOperationFailure(
-                    alloc,
-                    deps,
-                    "auth",
-                    error.McpAuthorizationIssuerMismatch,
-                );
-                return .handled_failure;
-            },
-        }
-    }
-    if (std.mem.eql(u8, operation, "logout")) {
-        if (rest.len != 2 or rest[1].len == 0) {
-            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-            return .handled_failure;
-        }
-        var loaded = loadMcpCommandRuntime(alloc, cfg, deps) catch |err| {
-            try writeMcpOperationFailure(alloc, deps, "logout", err);
-            return .handled_failure;
-        };
-        defer loaded.deinit(alloc);
-        try writeConfigDiagnostics(alloc, deps, loaded.startup.config_diagnostics);
-        const runtime = loaded.runtime orelse {
-            try writeMcpOperationFailure(alloc, deps, "logout", error.McpServerNotFound);
-            return .handled_failure;
-        };
-        const result = runtime.logoutServer(rest[1]) catch |err| {
-            try writeMcpOperationFailure(alloc, deps, "logout", err);
-            return .handled_failure;
-        };
-        var encoded_name = try text_utils.encodeTerminalSafe(alloc, rest[1], 160);
-        defer encoded_name.deinit(alloc);
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-        if (!result.removed) {
-            try out.writer.print(
-                "No stored MCP credentials found for '{s}'.\n",
-                .{encoded_name.bytes},
-            );
-        } else if (result.local_only) {
-            try out.writer.print(
-                "Logged out of MCP server '{s}' locally.\n",
-                .{encoded_name.bytes},
-            );
-        } else if (result.revocation_failed) {
-            try out.writer.print(
-                "Logged out of MCP server '{s}' locally; remote revocation failed.\n",
-                .{encoded_name.bytes},
-            );
-        } else {
-            try out.writer.print(
-                "Logged out of MCP server '{s}'.\n",
-                .{encoded_name.bytes},
-            );
-        }
-        try writeStdout(deps, out.written());
-        return .handled_success;
-    }
-
-    try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-    return .handled_failure;
-}
-
-fn parseTopLevelProjectMcpAction(
-    args: []const [:0]const u8,
-) error{InvalidProjectMcpTrustArgs}!project_config.ProjectMcpAction {
-    if (args.len == 1 and std.mem.eql(u8, args[0], "approve-all")) return .approve_all;
-    if (args.len == 1 and std.mem.eql(u8, args[0], "reset")) return .reset;
-    if (args.len != 2 or args[1].len == 0) return error.InvalidProjectMcpTrustArgs;
-    if (std.mem.eql(u8, args[0], "approve")) return .{ .approve = args[1] };
-    if (std.mem.eql(u8, args[0], "reject")) return .{ .reject = args[1] };
-    return error.InvalidProjectMcpTrustArgs;
-}
-
-fn writeMcpTrustSuccess(
-    alloc: Allocator,
-    deps: RunDeps,
-    workspace_root: []const u8,
-    action: project_config.ProjectMcpAction,
-) !void {
-    var encoded_root = try text_utils.encodeTerminalSafe(alloc, workspace_root, 512);
-    defer encoded_root.deinit(alloc);
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    switch (action) {
-        .approve => |name| {
-            var encoded_name = try text_utils.encodeTerminalSafe(alloc, name, 160);
-            defer encoded_name.deinit(alloc);
-            try out.writer.print(
-                "Approved project MCP server '{s}' for {s}.\n",
-                .{ encoded_name.bytes, encoded_root.bytes },
-            );
-        },
-        .reject => |name| {
-            var encoded_name = try text_utils.encodeTerminalSafe(alloc, name, 160);
-            defer encoded_name.deinit(alloc);
-            try out.writer.print(
-                "Rejected project MCP server '{s}' for {s}.\n",
-                .{ encoded_name.bytes, encoded_root.bytes },
-            );
-        },
-        .approve_all => try out.writer.print(
-            "Approved all project MCP servers for {s}.\n",
-            .{encoded_root.bytes},
-        ),
-        .reset => try out.writer.print(
-            "Reset project MCP trust for {s}.\n",
-            .{encoded_root.bytes},
-        ),
-    }
-    try writeStdout(deps, out.written());
-}
-
-fn openTopLevelMcpUrl(
-    raw: ?*anyopaque,
-    alloc: Allocator,
-    url: []const u8,
-) anyerror!bool {
-    const opener: *const host.UrlOpener = @ptrCast(@alignCast(raw.?));
-    return opener.open(alloc, url);
-}
-
-fn writeMcpProfileMutationSuccess(
-    alloc: Allocator,
-    deps: RunDeps,
-    action: []const u8,
-    preposition: []const u8,
-    name: []const u8,
-    path: []const u8,
-) !void {
-    var encoded_name = try text_utils.encodeTerminalSafe(alloc, name, 160);
-    defer encoded_name.deinit(alloc);
-    var encoded_path = try text_utils.encodeTerminalSafe(alloc, path, 512);
-    defer encoded_path.deinit(alloc);
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.print(
-        "{s} MCP server '{s}' {s} {s}.\n",
-        .{ action, encoded_name.bytes, preposition, encoded_path.bytes },
-    );
-    try writeStdout(deps, out.written());
-}
-
-fn writeMcpAddUsage(deps: RunDeps) !void {
-    return writeStderr(
-        deps,
-        "usage: fx mcp add NAME COMMAND [ARGS...] | fx mcp add --transport http NAME URL\n",
-    );
-}
-
-fn writeMcpOperationFailure(
-    alloc: Allocator,
-    deps: RunDeps,
-    operation: []const u8,
-    err: anyerror,
-) !void {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.print(
-        "fx mcp {s} failed: {s}.\n",
-        .{ operation, @errorName(err) },
-    );
-    try writeStderr(deps, out.written());
-}
-
-fn writeMcpProfileWarningIfPresent(
-    alloc: Allocator,
-    cfg: Config,
-    deps: RunDeps,
-) !void {
-    const diagnostic = try cfg.inspect_mcp_profile_config(alloc);
-    const warning = switch (diagnostic) {
-        .warning => |value| value,
-        .clear, .failed => return,
-    };
-    try writeMcpProfileWarning(alloc, deps, warning);
-}
-
-fn writeMcpProfileWarning(
-    alloc: Allocator,
-    deps: RunDeps,
-    warning: mcp_contract.ProfileConfigWarning,
-) !void {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.print(
-        "fx: ~/.fx/mcp.json warning: {s}",
-        .{@tagName(warning.cause)},
-    );
-    if (warning.key()) |key| {
-        var encoded = try text_utils.encodeTerminalSafe(alloc, key, 128);
-        defer encoded.deinit(alloc);
-        try out.writer.print(" key={s}", .{encoded.bytes});
-    }
-    try out.writer.print(
-        " additional_matches={d}\n",
-        .{warning.additional_matches},
-    );
-    try writeStderr(deps, out.written());
 }
 
 fn writeUsageOrJsonError(
@@ -3951,10 +3511,6 @@ test "parse recognizes every top-level command and preserves unknown commands" {
         .models => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
         else => return error.TestExpectedEqual,
     }
-    switch (parse(command_catalog, &.{ @constCast("mcp"), @constCast("add"), @constCast("fixture"), @constCast("node") })) {
-        .mcp => |rest| try std.testing.expectEqual(@as(usize, 3), rest.len),
-        else => return error.TestExpectedEqual,
-    }
     switch (parse(command_catalog, &.{@constCast("doctor")})) {
         .doctor => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
         else => return error.TestExpectedEqual,
@@ -4617,133 +4173,6 @@ test "runIfRequested help writes top-level help" {
     try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇x v0.0.0\nFast, native coding agent for the terminal."));
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), testConfig().version) != null);
     try std.testing.expectEqualStrings("", capture.stderr.written());
-}
-
-test "top-level MCP add mutates through the focused provider without startup" {
-    const alloc = std.testing.allocator;
-    var capture = CaptureOutput.init(alloc);
-    defer capture.deinit();
-    var cfg = testConfig();
-    cfg.add_mcp_profile_server = captureMcpProfileAddForTest;
-    mcp_profile_add_calls_for_test = 0;
-    var deps = capture.deps();
-    deps.load_startup_state = failingStartupState;
-
-    const result = try runIfRequestedWithDeps(
-        alloc,
-        &.{
-            @constCast("mcp"),
-            @constCast("add"),
-            @constCast("fixture"),
-            @constCast("node"),
-            @constCast("server.js"),
-        },
-        cfg,
-        deps,
-    );
-    try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expectEqual(@as(usize, 1), mcp_profile_add_calls_for_test);
-    try std.testing.expectEqualStrings(
-        "Saved MCP server 'fixture' to /tmp/test-home/.fx/mcp.json.\n",
-        capture.stdout.written(),
-    );
-    try std.testing.expectEqualStrings("", capture.stderr.written());
-}
-
-test "top-level MCP list loads configuration without discovery and remove uses its provider" {
-    const alloc = std.testing.allocator;
-    {
-        var capture = CaptureOutput.init(alloc);
-        defer capture.deinit();
-        var cfg = testConfig();
-        cfg.load_mcp_runtime = configuredMcpRuntimeForTest;
-        var deps = capture.deps();
-        deps.load_startup_state_without_credentials = stubLoadStartupStateWithoutCredentials;
-
-        const result = try runIfRequestedWithDeps(
-            alloc,
-            &.{ @constCast("mcp"), @constCast("list") },
-            cfg,
-            deps,
-        );
-        try std.testing.expectEqual(RunResult.handled_success, result);
-        try std.testing.expect(std.mem.find(
-            u8,
-            capture.stdout.written(),
-            "fixture source=profile scope=profile",
-        ) != null);
-        try std.testing.expect(std.mem.find(
-            u8,
-            capture.stdout.written(),
-            "state=disconnected",
-        ) != null);
-        try std.testing.expectEqualStrings("", capture.stderr.written());
-    }
-
-    {
-        var capture = CaptureOutput.init(alloc);
-        defer capture.deinit();
-        var cfg = testConfig();
-        cfg.remove_mcp_profile_server = captureMcpProfileRemoveForTest;
-        mcp_profile_remove_calls_for_test = 0;
-
-        const result = try runIfRequestedWithDeps(
-            alloc,
-            &.{ @constCast("mcp"), @constCast("remove"), @constCast("fixture") },
-            cfg,
-            capture.deps(),
-        );
-        try std.testing.expectEqual(RunResult.handled_success, result);
-        try std.testing.expectEqual(@as(usize, 1), mcp_profile_remove_calls_for_test);
-        try std.testing.expectEqualStrings(
-            "Removed MCP server 'fixture' from /tmp/test-home/.fx/mcp.json.\n",
-            capture.stdout.written(),
-        );
-        try std.testing.expectEqualStrings("", capture.stderr.written());
-    }
-}
-
-test "top-level MCP trust persists project approval without interactive startup" {
-    const alloc = std.testing.allocator;
-    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    defer alloc.free(workspace_root);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-    var environ = std.process.Environ.Map.init(alloc);
-    defer environ.deinit();
-    try environ.put("HOME", home);
-    try environ.put("PATH", "");
-    const stable_environ = try stableCliTestEnviron();
-    io_mod.setEnvironMap(&environ);
-    defer io_mod.setEnvironMap(stable_environ);
-
-    var capture = CaptureOutput.init(alloc);
-    defer capture.deinit();
-    var deps = capture.deps();
-    deps.load_startup_state_without_credentials = failingStartupStateWithoutCredentials;
-
-    const result = try runIfRequestedWithDeps(
-        alloc,
-        &.{ @constCast("mcp"), @constCast("trust"), @constCast("approve"), @constCast("fixture") },
-        testConfig(),
-        deps,
-    );
-    try std.testing.expectEqual(RunResult.handled_success, result);
-    const expected = try std.fmt.allocPrint(
-        alloc,
-        "Approved project MCP server 'fixture' for {s}.\n",
-        .{workspace_root},
-    );
-    defer alloc.free(expected);
-    try std.testing.expectEqualStrings(expected, capture.stdout.written());
-    try std.testing.expectEqualStrings("", capture.stderr.written());
-
-    var choices = try config_runtime.loadProjectMcpChoices(alloc, workspace_root);
-    defer choices.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), choices.choices.approved.len);
-    try std.testing.expectEqualStrings("fixture", choices.choices.approved[0]);
 }
 
 test "workspace launch modifiers preserve supported command help" {
@@ -5535,13 +4964,83 @@ test "runIfRequested local json success appends exactly one newline" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--json") }, testConfig(), deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
         capture.stdout.written(),
     );
     try std.testing.expect(!std.mem.endsWith(u8, capture.stdout.written(), "\n\n"));
 }
 
-test "status and doctor inspect MCP configuration once per command" {
+test "fx login deepseek activates its environment credential and default static model" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    try environ.put("HOME", home);
+    try environ.put("DEEPSEEK_API_KEY", "test-deepseek-key");
+    const stable_environ = try stableCliTestEnviron();
+    io_mod.setEnvironMap(&environ);
+    defer io_mod.setEnvironMap(stable_environ);
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+    var cfg = testConfig();
+    cfg.provider_set = test_builtin_providers.native;
+
+    const result = try runIfRequestedWithDeps(
+        alloc,
+        &.{ @constCast("login"), @constCast("deepseek") },
+        cfg,
+        capture.deps(),
+    );
+    try std.testing.expectEqual(RunResult.handled_success, result);
+    try std.testing.expectEqualStrings("Signed in with DeepSeek.\n", capture.stdout.written());
+    try std.testing.expectEqualStrings("", capture.stderr.written());
+
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    var settings = try config_runtime.loadMergedSettings(alloc, workspace_root);
+    defer settings.deinit(alloc);
+    try std.testing.expectEqual(model_provider.ProviderId.deepseek, settings.provider.?);
+    try std.testing.expectEqualStrings("deepseek-v4-flash", settings.models.get(.deepseek).?);
+    try std.testing.expect(settings.credential_source == null);
+}
+
+test "fx login deepseek reports the existing missing API key guidance" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    try environ.put("HOME", home);
+    const stable_environ = try stableCliTestEnviron();
+    io_mod.setEnvironMap(&environ);
+    defer io_mod.setEnvironMap(stable_environ);
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+
+    const result = try runIfRequestedWithDeps(
+        alloc,
+        &.{ @constCast("login"), @constCast("deepseek") },
+        testConfig(),
+        capture.deps(),
+    );
+    try std.testing.expectEqual(RunResult.handled_failure, result);
+    try std.testing.expectEqualStrings("", capture.stdout.written());
+    try std.testing.expectEqualStrings(
+        "fx login: " ++ credentials.missing_deepseek_credential_message ++ "\n",
+        capture.stderr.written(),
+    );
+}
+
+test "status and doctor inspect the supplied MCP profile diagnostic once" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5556,9 +5055,11 @@ test "status and doctor inspect MCP configuration once per command" {
     io_mod.setEnvironMap(&environ);
     defer io_mod.setEnvironMap(stable_environ);
 
-    mcp_local_inspection_calls_for_test = 0;
+    mcp_config_inspection_calls_for_test = 0;
+    mcp_runtime_load_calls_for_test = 0;
     var cfg = testConfig();
-    cfg.inspect_mcp_local_config = failingMcpLocalInspectionForTest;
+    cfg.inspect_mcp_profile_config = failingMcpConfigInspectionForTest;
+    cfg.load_mcp_runtime = countingMcpRuntimeForTest;
 
     var status_capture = CaptureOutput.init(alloc);
     defer status_capture.deinit();
@@ -5571,14 +5072,15 @@ test "status and doctor inspect MCP configuration once per command" {
         status_deps,
     );
     try std.testing.expectEqual(RunResult.handled_success, status_result);
-    try std.testing.expectEqual(@as(usize, 1), mcp_local_inspection_calls_for_test);
+    try std.testing.expectEqual(@as(usize, 1), mcp_config_inspection_calls_for_test);
+    try std.testing.expectEqual(@as(usize, 0), mcp_runtime_load_calls_for_test);
     try std.testing.expect(std.mem.find(
         u8,
         status_capture.stdout.written(),
         "\"mcp_config_error\":\"McpConfigInvalidJson\"",
     ) != null);
 
-    mcp_local_inspection_calls_for_test = 0;
+    mcp_config_inspection_calls_for_test = 0;
     var doctor_capture = CaptureOutput.init(alloc);
     defer doctor_capture.deinit();
     const doctor_result = try runIfRequestedWithDeps(
@@ -5588,7 +5090,8 @@ test "status and doctor inspect MCP configuration once per command" {
         doctor_capture.deps(),
     );
     try std.testing.expectEqual(RunResult.handled_success, doctor_result);
-    try std.testing.expectEqual(@as(usize, 1), mcp_local_inspection_calls_for_test);
+    try std.testing.expectEqual(@as(usize, 1), mcp_config_inspection_calls_for_test);
+    try std.testing.expectEqual(@as(usize, 0), mcp_runtime_load_calls_for_test);
     try std.testing.expectEqual(
         @as(usize, 1),
         std.mem.count(
@@ -5624,7 +5127,7 @@ test "writeRenderedJsonLine falls back to heap and appends exactly one newline" 
     );
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
         capture.stdout.written(),
     );
 }
@@ -5701,9 +5204,18 @@ const CaptureOutput = struct {
             .load_fn = captureSecretStoreLoad,
             .store_fn = captureSecretStoreWrite,
             .store_interactive_fn = captureSecretStoreInteractiveWrite,
+            .delete_fn = captureSecretStoreDelete,
         };
     }
 };
+
+fn captureSecretStoreDelete(
+    _: ?*anyopaque,
+    _: Allocator,
+    _: host.SecretStoreSlot,
+) host.SecretStoreWriteError!bool {
+    return false;
+}
 
 fn captureStdout(ctx: ?*anyopaque, text: []const u8) !void {
     const capture: *CaptureOutput = @ptrCast(@alignCast(ctx.?));
@@ -5738,6 +5250,7 @@ fn captureSecretStoreIsDisabled(ctx: ?*anyopaque) bool {
 fn captureSecretStoreLoad(
     _: ?*anyopaque,
     _: Allocator,
+    _: host.SecretStoreSlot,
 ) host.SecretStoreLoadError!?[]u8 {
     return null;
 }
@@ -5745,6 +5258,7 @@ fn captureSecretStoreLoad(
 fn captureSecretStoreWrite(
     ctx: ?*anyopaque,
     _: Allocator,
+    _: host.SecretStoreSlot,
     value: []const u8,
 ) host.SecretStoreWriteError!void {
     const capture: *CaptureOutput = @ptrCast(@alignCast(ctx.?));
@@ -5754,6 +5268,7 @@ fn captureSecretStoreWrite(
 
 fn captureSecretStoreInteractiveWrite(
     ctx: ?*anyopaque,
+    _: host.SecretStoreSlot,
 ) host.SecretStoreWriteError!bool {
     const capture: *CaptureOutput = @ptrCast(@alignCast(ctx.?));
     if (!capture.setup_interactive_store) return false;
@@ -5777,7 +5292,7 @@ const test_surface_context_registry = context_contract.Registry{ .default_provid
     .append_transient_fn = appendNoopTransientContextForTest,
 } };
 
-fn noMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
+fn noMcpRuntimeForTest(_: Allocator, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
     return null;
 }
 
@@ -5787,69 +5302,22 @@ fn clearMcpConfigInspectionForTest(
     return .clear;
 }
 
-var mcp_local_inspection_calls_for_test: usize = 0;
-var mcp_profile_add_calls_for_test: usize = 0;
-var mcp_profile_remove_calls_for_test: usize = 0;
+var mcp_config_inspection_calls_for_test: usize = 0;
+var mcp_runtime_load_calls_for_test: usize = 0;
 
-fn captureMcpProfileAddForTest(
-    alloc: Allocator,
-    intent: mcp_command_provider.AddIntent,
-) anyerror!mcp_command_provider.ProfileAddResult {
-    mcp_profile_add_calls_for_test += 1;
-    switch (intent) {
-        .local => |local| {
-            try std.testing.expectEqualStrings("fixture", local.name);
-            try std.testing.expectEqualStrings("node", local.command);
-            try std.testing.expectEqualSlices([]const u8, &.{"server.js"}, local.args);
-        },
-        .http => return error.TestUnexpectedResult,
-    }
-    return .{
-        .profile_path = try alloc.dupe(u8, "/tmp/test-home/.fx/mcp.json"),
-    };
+fn failingMcpConfigInspectionForTest(
+    _: Allocator,
+) error{OutOfMemory}!mcp_contract.ProfileConfigDiagnostic {
+    mcp_config_inspection_calls_for_test += 1;
+    return .{ .failed = error.McpConfigInvalidJson };
 }
 
-fn captureMcpProfileRemoveForTest(
-    alloc: Allocator,
-    name: []const u8,
-) anyerror!mcp_command_provider.ProfileRemoveResult {
-    mcp_profile_remove_calls_for_test += 1;
-    try std.testing.expectEqualStrings("fixture", name);
-    return .{
-        .profile_path = try alloc.dupe(u8, "/tmp/test-home/.fx/mcp.json"),
-        .removed = true,
-    };
-}
-
-fn configuredMcpRuntimeForTest(
-    alloc: Allocator,
-    workspace_root: []const u8,
+fn countingMcpRuntimeForTest(
+    _: Allocator,
     _: @import("../mcp/elicitation.zig").Capabilities,
 ) !?*mcp_runtime.McpRuntime {
-    try std.testing.expectEqualStrings("/tmp/fx", workspace_root);
-    const runtime = try alloc.create(mcp_runtime.McpRuntime);
-    errdefer alloc.destroy(runtime);
-    runtime.* = mcp_runtime.McpRuntime.init(alloc);
-    errdefer runtime.deinit();
-    try runtime.addServer(.{
-        .name = try alloc.dupe(u8, "fixture"),
-        .command = try alloc.dupe(u8, "node"),
-    });
-    return runtime;
-}
-
-fn failingMcpLocalInspectionForTest(
-    alloc: Allocator,
-    workspace_root: []const u8,
-) error{OutOfMemory}!mcp_health.LocalConfigInspection {
-    mcp_local_inspection_calls_for_test += 1;
-    var result = try mcp_health.inspectLocalConfigUnavailable(
-        alloc,
-        workspace_root,
-    );
-    result.profile_diagnostic = .{ .failed = error.McpConfigInvalidJson };
-    result.inspection_error = "McpConfigInvalidJson";
-    return result;
+    mcp_runtime_load_calls_for_test += 1;
+    return null;
 }
 
 var stable_cli_test_environ: ?*std.process.Environ.Map = null;
@@ -5921,27 +5389,6 @@ fn stubLoadStartupState(
     };
     state.credential.?.team_id = try alloc.dupe(u8, "team_123");
     return state;
-}
-
-fn stubLoadStartupStateWithoutCredentials(
-    alloc: Allocator,
-    _: []const u8,
-    default_agent_step_limit: usize,
-) !app_lifecycle.StartupState {
-    var state = app_lifecycle.StartupState{
-        .agent_step_limit = default_agent_step_limit,
-    };
-    errdefer state.deinit(alloc);
-    state.workspace_root = try alloc.dupe(u8, "/tmp/fx");
-    return state;
-}
-
-fn failingStartupStateWithoutCredentials(
-    _: Allocator,
-    _: []const u8,
-    _: usize,
-) !app_lifecycle.StartupState {
-    return error.StartupShouldNotRun;
 }
 
 fn stubLoadCatalogStartupState(

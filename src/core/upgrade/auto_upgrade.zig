@@ -28,6 +28,7 @@ pub const RelaunchRequest = struct {
 };
 
 pub fn shouldEnableForCurrentExecutable() bool {
+    if (helpers.resolveCdnBase() == null) return false;
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const n = std.process.executablePath(io_mod.getIo(), &exe_buf) catch return true;
     return !isDevelopmentBuildPath(exe_buf[0..n]);
@@ -65,6 +66,7 @@ pub const AutoUpgrade = struct {
         alloc: Allocator,
         current: update_target.CurrentBuild,
     ) void {
+        if (helpers.resolveCdnBase() == null) return;
         self.thread = std.Thread.spawn(.{}, runLoop, .{ self, alloc, current }) catch return;
     }
 
@@ -171,7 +173,7 @@ pub const AutoUpgrade = struct {
         alloc: Allocator,
         current: update_target.CurrentBuild,
     ) void {
-        const cdn_base = helpers.resolveCdnBase();
+        const cdn_base = helpers.resolveCdnBase() orelse return;
         var target = helpers.fetchTarget(alloc, self.selected_channel, cdn_base) catch return;
         defer target.deinit(alloc);
 
@@ -276,6 +278,10 @@ test "development build paths disable auto upgrade" {
     try std.testing.expect(isDevelopmentBuildPath("/repo/zig-out/bin/fx"));
     try std.testing.expect(isDevelopmentBuildPath("C:\\repo\\zig-out\\bin\\fx.exe"));
     try std.testing.expect(!isDevelopmentBuildPath("/Users/me/.local/bin/fx"));
+}
+
+test "auto upgrade stays off without a loopback e2e base" {
+    try std.testing.expect(!shouldEnableForCurrentExecutable());
 }
 
 test "statusLabel downloading shows ellipsis" {

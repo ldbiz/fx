@@ -340,6 +340,9 @@ fn encodeWireCanonical(
     if (version == schema_version) {
         return encodeWireCanonicalV6(alloc, ledger);
     }
+    if (version == base64_delivery_schema_version) {
+        return encodeWireCanonicalV5(alloc, ledger);
+    }
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     std.json.Stringify.value(WireRecord{
@@ -1173,7 +1176,11 @@ test "schema v5 approvals without file projection remain compatible" {
         .created_at_ms = 1,
     });
     ledger.capacity_version = communication.capacity_contract_version;
-    const current = try encodeWireCanonicalV5(alloc, ledger);
+    const current = try encodeWireCanonical(
+        alloc,
+        base64_delivery_schema_version,
+        ledger,
+    );
     defer alloc.free(current);
     try std.testing.expect(std.mem.find(u8, current, "\"file\":null,") != null);
     const legacy = try std.mem.replaceOwned(

@@ -115,6 +115,7 @@ fn writeResponsesInput(
     images: ?[]const image_attachments.VerifiedSnapshot,
 ) !void {
     return responses_protocol.writeInput(writer, alloc, messages, images, .{
+        .provider = .codex,
         .tool_calls = max_tool_calls,
         .tool_identity_bytes = max_tool_identity_bytes,
         .tool_arguments_bytes = max_tool_arguments_bytes,
@@ -280,7 +281,7 @@ pub fn streamPrepared(
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
     var events = request.events;
-    var completion = try consumeSse(
+    const completion = try consumeSse(
         alloc,
         reader,
         &events,
@@ -292,29 +293,9 @@ pub fn streamPrepared(
         request.content_capture_limit,
         .{},
     );
-    errdefer {
-        var owned = stream_provider.Result{ .completed = .{
-            .completion = completion,
-            .ownership = .owned,
-        } };
-        owned.deinit(alloc);
-    }
-    const usage_outcome: stream_provider.UsageOutcome = usage: {
-        if (completion.generation_id == null) {
-            break :usage .{ .unavailable = .possibly_billed };
-        }
-        completion.billing = try responses_protocol.buildSubscriptionBilling(
-            alloc,
-            .codex,
-            request.model,
-            @max(io_mod.milliTimestamp(), 0),
-            completion.usage,
-        ) orelse break :usage .{ .unavailable = .possibly_billed };
-        break :usage .{ .exact = .codex };
-    };
     return .{ .completed = .{
         .completion = completion,
-        .usage = usage_outcome,
+        .usage = .{ .immediate = null },
         .ownership = .owned,
     } };
 }
@@ -483,6 +464,7 @@ test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas
         .{
             .role = .assistant,
             .tool_calls = &.{.{ .id = "call_1", .name = "read_file", .arguments_json = "{\"path\":\"README.md\"}" }},
+            .provider_state_owner = .codex,
             .provider_state_json = "[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}]",
         },
         .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .content = "contents" },
@@ -558,6 +540,7 @@ test "OpenAI Codex replay provider state accepts the limit and rejects one byte 
         defer std.testing.allocator.free(provider_state);
         const messages = [_]types.ChatMessage{.{
             .role = .assistant,
+            .provider_state_owner = .codex,
             .provider_state_json = provider_state,
         }};
         try expectOpenAICodexReplaySuccess(&messages);
@@ -567,6 +550,7 @@ test "OpenAI Codex replay provider state accepts the limit and rejects one byte 
         defer std.testing.allocator.free(provider_state);
         const messages = [_]types.ChatMessage{.{
             .role = .assistant,
+            .provider_state_owner = .codex,
             .provider_state_json = provider_state,
         }};
         try expectOpenAICodexReplayError(error.OpenAICodexProviderStateTooLarge, &messages);

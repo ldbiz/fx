@@ -11,6 +11,7 @@ pub const ProviderSwitchDecision = enum {
 pub const ProviderSwitchIntent = enum {
     manual,
     post_oauth,
+    post_api_key,
 };
 
 pub const ProviderSwitchFacts = struct {
@@ -39,6 +40,7 @@ pub const LogoutFacts = struct {
 
 pub fn decideLogoutProvider(facts: LogoutFacts) model_provider.ProviderId {
     if (facts.requested) |provider| return provider;
+    if (facts.selected == .deepseek or facts.active_source == .deepseek_api_key or facts.active_source == .deepseek_stored_key) return .deepseek;
     if (facts.selected == .grok or facts.active_source == .grok_subscription) return .grok;
     if (facts.selected == .codex or facts.active_source == .chatgpt_subscription) return .codex;
 
@@ -73,6 +75,10 @@ pub fn signInCompletion(
             .{ .switch_provider = .grok }
         else
             .{ .activate_source = .grok_subscription },
+        .deepseek => if (provider_routing_supported)
+            .{ .switch_provider = .deepseek }
+        else
+            .{ .activate_source = .deepseek_stored_key },
     };
 }
 
@@ -106,6 +112,12 @@ test "provider switch and logout decisions are pure and provider keyed" {
         .requested = .grok,
         .selected = .codex,
         .active_source = .chatgpt_subscription,
+        .available_sources = inventory,
+    }));
+    try std.testing.expectEqual(model_provider.ProviderId.deepseek, decideLogoutProvider(.{
+        .requested = null,
+        .selected = .deepseek,
+        .active_source = .deepseek_api_key,
         .available_sources = inventory,
     }));
 }
