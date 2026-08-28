@@ -11,7 +11,7 @@
  ⣿⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ```
 
-# DeepSeek fork of fx
+# DeepSeek-friendly fork of fx
 
 This is a fork of [fx](https://github.com/vercel-labs/fx). Its purpose is a first-class DeepSeek provider: fx talks to DeepSeek directly at `https://api.deepseek.com` with your API key. You can currently access DeepSeek in the original but must go through a Vercel account requiring a credit card and no obvious way to have a hard limit. This fork removes that middle-man; you still need a DeepSeek account. ChatGPT login is unchanged, as is the rest of fx. NB. fx stores API keys in plaintext on linux when necessary.
 
